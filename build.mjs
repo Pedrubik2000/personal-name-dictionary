@@ -5,9 +5,13 @@ import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import pLimit from "p-limit";
 import { Dictionary, DictionaryIndex, TermEntry } from "yomichan-dict-builder";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const execFileAsync = promisify(execFile);
 
 const API = "https://graphql.anilist.co";
 
@@ -56,74 +60,87 @@ function splitParts(s) {
  * JMnedict docs + licensing: attribution/share-alike required. :contentReference[oaicite:2]{index=2}
  */
 async function loadJmnedictSets() {
-  // Fallback source: scriptin/jmdict-simplified release assets (stable HTTPS).
-  // Format docs show JMnedict root has `words`, and each word has `kanji[]` and `translation[].type[]`. :contentReference[oaicite:1]{index=1}
+  // We avoid GitHub API (403 rate-limit) by scraping the releases/latest HTML
+  // and downloading the JMnedict asset directly from the release.
+  // Assets exist as *.json.tgz (and *.json.zip) on releases. :contentReference[oaicite:1]{index=1}
 
-  console.log("Downloading JMnedict JSON from scriptin/jmdict-simplified (GitHub Releases)…");
+  console.log("Resolving latest scriptin/jmdict-simplified release (no GitHub API)…");
 
-  const ghRes = await fetch("https://api.github.com/repos/scriptin/jmdict-simplified/releases/latest", {
-    headers: {
-      "User-Agent": "anilist-yomitan-generator",
-      "Accept": "application/vnd.github+json"
-    }
-  });
-  if (!ghRes.ok) throw new Error(`GitHub API failed: ${ghRes.status}`);
-
-  const release = await ghRes.json();
-  const assets = Array.isArray(release.assets) ? release.assets : [];
-
-  // We want the full English JMnedict JSON (NOT common-only).
-  // Asset naming varies by release, so match loosely:
-  //  - contains "jmnedict"
-  //  - contains "eng" OR "en" OR "all"
-  //  - ends with .json.gz (preferred) or .json
-  const pick = (a) => String(a.name || "").toLowerCase();
-
-  const candidates = assets
-    .filter(a => pick(a).includes("jmnedict"))
-    .filter(a => pick(a).endsWith(".json.gz") || pick(a).endsWith(".json"))
-    .sort((a, b) => {
-      const an = pick(a), bn = pick(b);
-      // Prefer english/all over other languages, and prefer full over common-only
-      const score = (n) =>
-        (n.includes("common") ? -50 : 0) +
-        (n.includes("eng") || n.includes("en") ? 20 : 0) +
-        (n.includes("all") ? 10 : 0) +
-        (n.endsWith(".json.gz") ? 5 : 0);
-      return score(bn) - score(an);
-    });
-
-  const asset = candidates[0];
-  if (!asset?.browser_download_url) {
-    throw new Error("Could not find a JMnedict .json(.gz) asset in latest release assets.");
-  }
-
-  console.log("Using asset:", asset.name);
-
-  const res = await fetch(asset.browser_download_url, {
+  const latestUrl = "https://github.com/scriptin/jmdict-simplified/releases/latest";
+  const res = await fetch(latestUrl, {
     headers: { "User-Agent": "anilist-yomitan-generator" }
   });
-  if (!res.ok) throw new Error(`JMnedict asset download failed: ${res.status}`);
+  if (!res.ok) throw new Error(`Failed to open releases/latest: ${res.status}`);
 
-  const buf = Buffer.from(await res.arrayBuffer());
-  const jsonBuf = asset.name.toLowerCase().endsWith(".gz") ? zlib.gunzipSync(buf) : buf;
+  // After redirects, res.url ends with /releases/tag/<TAG>
+  const finalUrl = res.url;
+  const tagEnc = finalUrl.split("/").pop();
+  const tag = decodeURIComponent(tagEnc || "");
+  if (!tag) throw new Error("Could not resolve latest release tag.");
+
+  const html = await res.text();
+
+  // Find the JMnedict English TGZ asset name in the HTML.
+  // Example pattern: jmnedict-eng-3.6.2+20260126123038.json.tgz
+  const m = html.match(/jmnedict-eng-[^"'<>\s]+\.json\.tgz/);
+  if (!m) {
+    // fallback: zip
+    const mz = html.match(/jmnedict-eng-[^"'<>\s]+\.json\.zip/);
+    if (!mz) {
+      throw new Error("Could not find jmnedict-eng asset name in latest release HTML.");
+    }
+    throw new Error("Found only .zip asset; this loader currently expects .json.tgz. Use .tgz release asset.");
+  }
+
+  const assetName = m[0];
+  const downloadUrl =
+    `https://github.com/scriptin/jmdict-simplified/releases/download/${encodeURIComponent(tag)}/${assetName}`;
+
+  console.log("Latest tag:", tag);
+  console.log("Downloading:", assetName);
+
+  const assetRes = await fetch(downloadUrl, {
+    headers: { "User-Agent": "anilist-yomitan-generator" }
+  });
+  if (!assetRes.ok) throw new Error(`JMnedict asset download failed: ${assetRes.status}`);
+
+  const tmpRoot = path.join(os.tmpdir(), `jmnedict-${Date.now()}`);
+  const tgzPath = path.join(tmpRoot, assetName);
+  const extractDir = path.join(tmpRoot, "extract");
+
+  await fs.mkdir(extractDir, { recursive: true });
+
+  const buf = Buffer.from(await assetRes.arrayBuffer());
+  await fs.writeFile(tgzPath, buf);
+
+  // Extract .tgz using system tar (available on ubuntu runners)
+  // tar -xzf <tgz> -C <extractDir>
+  await execFileAsync("tar", ["-xzf", tgzPath, "-C", extractDir]);
+
+  // Find the extracted .json (usually something like jmnedict-eng-3.6.2.json)
+  const files = await fs.readdir(extractDir);
+  const jsonFile = files.find(f => f.toLowerCase().endsWith(".json"));
+  if (!jsonFile) throw new Error("Extracted TGZ but no .json file found.");
+
+  const jsonPath = path.join(extractDir, jsonFile);
+  const jsonText = await fs.readFile(jsonPath, "utf8");
 
   let root;
   try {
-    root = JSON.parse(jsonBuf.toString("utf8"));
-  } catch (e) {
+    root = JSON.parse(jsonText);
+  } catch {
     throw new Error("Failed to parse JMnedict JSON (unexpected format).");
   }
 
-  // Root format: { words: JMnedictWord[] } :contentReference[oaicite:2]{index=2}
+  // Root format from jmdict-simplified is { words: [...] }
   const words = Array.isArray(root?.words) ? root.words : [];
   if (words.length === 0) throw new Error("JMnedict JSON has no words[] (unexpected).");
 
   const surnames = new Set();
   const givennames = new Set();
 
-  // Name type tags are in translation[].type[] as Tag values :contentReference[oaicite:3]{index=3}
-  // Common tag values include "surname", "given", etc. We'll check for those.
+  // In jmdict-simplified JMnedict, type tags live in translation[].type[].
+  // We'll accept surname/family for surnames, given/person/fem/masc for givens.
   const isSurnameType = (t) => t === "surname" || t === "family";
   const isGivenType = (t) => t === "given" || t === "person" || t === "fem" || t === "masc";
 
@@ -131,29 +148,28 @@ async function loadJmnedictSets() {
     const kanjiArr = Array.isArray(w?.kanji) ? w.kanji : [];
     const transArr = Array.isArray(w?.translation) ? w.translation : [];
 
-    // collect all types
     const types = new Set();
     for (const tr of transArr) {
       const ty = Array.isArray(tr?.type) ? tr.type : [];
       for (const x of ty) if (typeof x === "string") types.add(x);
     }
 
-    const surname = [...types].some(isSurnameType);
-    const given = [...types].some(isGivenType);
-
-    if (!surname && !given) continue;
+    const isSurname = [...types].some(isSurnameType);
+    const isGiven = [...types].some(isGivenType);
+    if (!isSurname && !isGiven) continue;
 
     for (const k of kanjiArr) {
       const txt = String(k?.text || "").trim();
       if (!txt || !isAllCjk(txt)) continue;
-      if (surname) surnames.add(txt);
-      if (given) givennames.add(txt);
+      if (isSurname) surnames.add(txt);
+      if (isGiven) givennames.add(txt);
     }
   }
 
   console.log("JMnedict loaded:", { surnames: surnames.size, givennames: givennames.size });
   return { surnames, givennames };
 }
+
 
 
 function bestSplitWithJmnedict(nativeKanji, jm) {
