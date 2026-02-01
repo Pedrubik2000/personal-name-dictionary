@@ -16,7 +16,8 @@ const execFileAsync = promisify(execFile);
 const API = "https://graphql.anilist.co";
 
 // Official JMnedict distribution location (EDRDG) :contentReference[oaicite:1]{index=1}
-const JMNEDICT_GZ_URL = "https://ftp.edrdg.org/pub/Nihongo/JMnedict.xml.gz";
+const JMNEDICT_GZ_URL = "https://www.edrdg.org/pub/Nihongo/JMnedict.xml.gz";
+
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -53,6 +54,30 @@ function splitParts(s) {
     .filter(Boolean);
 }
 
+async function fetchWithRetry(url, opts = {}, retries = 5) {
+  let lastErr;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, {
+        ...opts,
+        headers: {
+          "User-Agent": "anilist-yomitan-generator",
+          ...(opts.headers || {}),
+        },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res;
+    } catch (e) {
+      lastErr = e;
+      const wait = 1500 * (i + 1) + Math.floor(Math.random() * 800);
+      console.log(`JMnedict fetch retry ${i + 1}/${retries} after ${Math.round(wait/1000)}s… (${e.message})`);
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+
+
 /**
  * Streaming JMnedict parser -> sets of kanji surnames + given names.
  * We only keep <keb> strings from entries whose <name_type> indicates surname/given/etc.
@@ -67,9 +92,8 @@ async function loadJmnedictSets() {
   console.log("Resolving latest scriptin/jmdict-simplified release (no GitHub API)…");
 
   const latestUrl = "https://github.com/scriptin/jmdict-simplified/releases/latest";
-  const res = await fetch(latestUrl, {
-    headers: { "User-Agent": "anilist-yomitan-generator" }
-  });
+  const res = await fetchWithRetry(JMNEDICT_GZ_URL);
+
   if (!res.ok) throw new Error(`Failed to open releases/latest: ${res.status}`);
 
   // After redirects, res.url ends with /releases/tag/<TAG>
