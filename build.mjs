@@ -150,6 +150,13 @@ async function fetchCharactersForMedia(mediaId, perTitle) {
 function buildTermEntry(term, html) {
   const te = new TermEntry(term);
 
+  // Some versions require reading to be explicitly set (can be empty)
+  if (typeof te.setReading === "function") {
+    te.setReading(""); // required by builder; empty is OK for names
+  } else if (typeof te.setKana === "function") {
+    te.setKana(""); // fallback name in some versions
+  }
+
   // Prefer the most detailed method if present; fall back gracefully
   if (typeof te.addDetailedDefinition === "function") {
     return te.addDetailedDefinition(html).build();
@@ -161,9 +168,9 @@ function buildTermEntry(term, html) {
     return te.addGlossary(html).build();
   }
 
-  // Last resort: some versions accept constructor options; throw if unknown
   throw new Error("Unsupported yomichan-dict-builder version: no known TermEntry definition method.");
 }
+
 
 async function main() {
   const userName = process.env.ANILIST_USER;
