@@ -4,7 +4,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import pLimit from "p-limit";
-import { SaxesParser } from "saxes";
 import { Dictionary, DictionaryIndex, TermEntry } from "yomichan-dict-builder";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -57,88 +56,105 @@ function splitParts(s) {
  * JMnedict docs + licensing: attribution/share-alike required. :contentReference[oaicite:2]{index=2}
  */
 async function loadJmnedictSets() {
-  console.log("Downloading JMnedict.xml.gz…");
-  const res = await fetch(JMNEDICT_GZ_URL);
-  if (!res.ok) throw new Error(`JMnedict download failed: ${res.status}`);
+  // Fallback source: scriptin/jmdict-simplified release assets (stable HTTPS).
+  // Format docs show JMnedict root has `words`, and each word has `kanji[]` and `translation[].type[]`. :contentReference[oaicite:1]{index=1}
 
-  const gzBuf = Buffer.from(await res.arrayBuffer());
-  const xmlBuf = zlib.gunzipSync(gzBuf);
+  console.log("Downloading JMnedict JSON from scriptin/jmdict-simplified (GitHub Releases)…");
 
-  console.log("Parsing JMnedict (stream)…");
+  const ghRes = await fetch("https://api.github.com/repos/scriptin/jmdict-simplified/releases/latest", {
+    headers: {
+      "User-Agent": "anilist-yomitan-generator",
+      "Accept": "application/vnd.github+json"
+    }
+  });
+  if (!ghRes.ok) throw new Error(`GitHub API failed: ${ghRes.status}`);
+
+  const release = await ghRes.json();
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+
+  // We want the full English JMnedict JSON (NOT common-only).
+  // Asset naming varies by release, so match loosely:
+  //  - contains "jmnedict"
+  //  - contains "eng" OR "en" OR "all"
+  //  - ends with .json.gz (preferred) or .json
+  const pick = (a) => String(a.name || "").toLowerCase();
+
+  const candidates = assets
+    .filter(a => pick(a).includes("jmnedict"))
+    .filter(a => pick(a).endsWith(".json.gz") || pick(a).endsWith(".json"))
+    .sort((a, b) => {
+      const an = pick(a), bn = pick(b);
+      // Prefer english/all over other languages, and prefer full over common-only
+      const score = (n) =>
+        (n.includes("common") ? -50 : 0) +
+        (n.includes("eng") || n.includes("en") ? 20 : 0) +
+        (n.includes("all") ? 10 : 0) +
+        (n.endsWith(".json.gz") ? 5 : 0);
+      return score(bn) - score(an);
+    });
+
+  const asset = candidates[0];
+  if (!asset?.browser_download_url) {
+    throw new Error("Could not find a JMnedict .json(.gz) asset in latest release assets.");
+  }
+
+  console.log("Using asset:", asset.name);
+
+  const res = await fetch(asset.browser_download_url, {
+    headers: { "User-Agent": "anilist-yomitan-generator" }
+  });
+  if (!res.ok) throw new Error(`JMnedict asset download failed: ${res.status}`);
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  const jsonBuf = asset.name.toLowerCase().endsWith(".gz") ? zlib.gunzipSync(buf) : buf;
+
+  let root;
+  try {
+    root = JSON.parse(jsonBuf.toString("utf8"));
+  } catch (e) {
+    throw new Error("Failed to parse JMnedict JSON (unexpected format).");
+  }
+
+  // Root format: { words: JMnedictWord[] } :contentReference[oaicite:2]{index=2}
+  const words = Array.isArray(root?.words) ? root.words : [];
+  if (words.length === 0) throw new Error("JMnedict JSON has no words[] (unexpected).");
+
   const surnames = new Set();
   const givennames = new Set();
 
-  const parser = new SaxesParser({ xmlns: false });
+  // Name type tags are in translation[].type[] as Tag values :contentReference[oaicite:3]{index=3}
+  // Common tag values include "surname", "given", etc. We'll check for those.
+  const isSurnameType = (t) => t === "surname" || t === "family";
+  const isGivenType = (t) => t === "given" || t === "person" || t === "fem" || t === "masc";
 
-  let text = "";
-  let inEntry = false;
+  for (const w of words) {
+    const kanjiArr = Array.isArray(w?.kanji) ? w.kanji : [];
+    const transArr = Array.isArray(w?.translation) ? w.translation : [];
 
-  /** @type {string[]} */
-  let kebs = [];
-  /** @type {Set<string>} */
-  let nameTypes = new Set();
-
-  // Track which element text belongs to
-  let currentTag = "";
-
-  parser.on("opentag", (node) => {
-    currentTag = node.name;
-    if (node.name === "entry") {
-      inEntry = true;
-      kebs = [];
-      nameTypes = new Set();
-    }
-    text = "";
-  });
-
-  parser.on("text", (t) => { text += t; });
-  parser.on("cdata", (t) => { text += t; });
-
-  parser.on("closetag", (tag) => {
-    const val = text.trim();
-    if (!inEntry) { text = ""; currentTag = ""; return; }
-
-    if (tag === "keb" && val) {
-      kebs.push(val);
+    // collect all types
+    const types = new Set();
+    for (const tr of transArr) {
+      const ty = Array.isArray(tr?.type) ? tr.type : [];
+      for (const x of ty) if (typeof x === "string") types.add(x);
     }
 
-    if (tag === "name_type" && val) {
-      // JMnedict name_type values include things like "surname", "given", etc.
-      nameTypes.add(val);
+    const surname = [...types].some(isSurnameType);
+    const given = [...types].some(isGivenType);
+
+    if (!surname && !given) continue;
+
+    for (const k of kanjiArr) {
+      const txt = String(k?.text || "").trim();
+      if (!txt || !isAllCjk(txt)) continue;
+      if (surname) surnames.add(txt);
+      if (given) givennames.add(txt);
     }
-
-    if (tag === "entry") {
-      // Decide if this entry is a surname/given name entry
-      const isSurname = nameTypes.has("surname") || nameTypes.has("family");
-      const isGiven =
-        nameTypes.has("given") ||
-        nameTypes.has("person") ||
-        nameTypes.has("fem") ||
-        nameTypes.has("masc");
-
-      if (isSurname || isGiven) {
-        for (const k of kebs) {
-          if (!k || !isAllCjk(k)) continue;
-          if (isSurname) surnames.add(k);
-          if (isGiven) givennames.add(k);
-        }
-      }
-
-      inEntry = false;
-      kebs = [];
-      nameTypes = new Set();
-    }
-
-    text = "";
-    currentTag = "";
-  });
-
-  parser.write(xmlBuf.toString("utf8"));
-  parser.close();
+  }
 
   console.log("JMnedict loaded:", { surnames: surnames.size, givennames: givennames.size });
   return { surnames, givennames };
 }
+
 
 function bestSplitWithJmnedict(nativeKanji, jm) {
   const s = String(nativeKanji || "").trim();
