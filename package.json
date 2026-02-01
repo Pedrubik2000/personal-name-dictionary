@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "p-limit": "^6.2.0",
-    "yomichan-dict-builder": "^2.10.0"
+    "yomichan-dict-builder": "^2.10.0",
+    "saxes": "^6.0.0"
   }
 }
