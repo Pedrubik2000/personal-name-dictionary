@@ -1,13 +1,13 @@
 {
-  "name": "anilist-yomitan-actions",
+  "name": "anilist-yomitan-characters",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "build": "node build.mjs"
   },
   "dependencies": {
-    "node-fetch": "^3.3.2",
-    "p-limit": "^6.1.0",
-    "yomichan-dict-builder": "^1.2.0"
+    "p-limit": "^6.2.0",
+    "yomichan-dict-builder": "^2.10.0"
   }
 }
