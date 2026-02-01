@@ -1,3 +1,4 @@
+// build.mjs
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,6 +41,18 @@ function makeAliases(nameNative, nameFull) {
   if (nameFull) add(String(nameFull).toLowerCase());
 
   return [...aliases];
+}
+
+// Convert an image URL to an embedded data URL (base64)
+// This avoids dictionary.addFile() API differences across library versions.
+async function imageUrlToDataUrl(url) {
+  if (!url) return "";
+  const res = await fetch(url);
+  if (!res.ok) return "";
+  const buf = Buffer.from(await res.arrayBuffer());
+  const contentType = res.headers.get("content-type") || "image/jpeg";
+  const b64 = buf.toString("base64");
+  return `data:${contentType};base64,${b64}`;
 }
 
 // GraphQL with rate-limit backoff
@@ -133,13 +146,23 @@ async function fetchCharactersForMedia(mediaId, perTitle) {
     .filter(c => c.id && (c.nameNative || c.nameFull));
 }
 
-async function downloadToFile(url, outPath) {
-  if (!url) return false;
-  const res = await fetch(url);
-  if (!res.ok) return false;
-  const buf = Buffer.from(await res.arrayBuffer());
-  await fs.writeFile(outPath, buf);
-  return true;
+// Try TermEntry methods across versions
+function buildTermEntry(term, html) {
+  const te = new TermEntry(term);
+
+  // Prefer the most detailed method if present; fall back gracefully
+  if (typeof te.addDetailedDefinition === "function") {
+    return te.addDetailedDefinition(html).build();
+  }
+  if (typeof te.addDefinition === "function") {
+    return te.addDefinition(html).build();
+  }
+  if (typeof te.addGlossary === "function") {
+    return te.addGlossary(html).build();
+  }
+
+  // Last resort: some versions accept constructor options; throw if unknown
+  throw new Error("Unsupported yomichan-dict-builder version: no known TermEntry definition method.");
 }
 
 async function main() {
@@ -184,53 +207,49 @@ async function main() {
       charMap.get(key).fromSet.add(t.title);
     }
 
-    // pace requests (still might hit 429; gql() retries too)
+    // pacing to reduce 429 risk
     await sleep(450);
   }
 
   console.log("Unique characters:", charMap.size);
 
   const outDir = path.join(__dirname, "out");
-  const tmpDir = path.join(__dirname, "tmp_images");
   await fs.mkdir(outDir, { recursive: true });
-  await fs.mkdir(tmpDir, { recursive: true });
 
   const zipName = `anilist-characters-current-${userName}.zip`;
   const dictionary = new Dictionary({ fileName: zipName });
 
-const index = new DictionaryIndex()
-  .setTitle(`AniList Characters (CURRENT) — ${userName}`)
-  .setRevision("1")
-  .setAuthor("AniList → Yomitan Generator (GitHub Actions)")
-  .setDescription("Character dictionary from AniList CURRENT only. Images bundled. Spoilers removed. Supports full + partial name lookup.")
-  .setAttribution("Data from AniList (anilist.co). Character images/descriptions provided by AniList content sources. Generated for personal use.")
-  .build();
-
+  const index = new DictionaryIndex()
+    .setTitle(`AniList Characters (CURRENT) — ${userName}`)
+    .setRevision("1")
+    .setAuthor("AniList → Yomitan Generator (GitHub Actions)")
+    .setDescription("Character dictionary from AniList CURRENT only. Images embedded as data URLs. Spoilers removed. Supports full + partial name lookup.")
+    .setAttribution("Data via AniList GraphQL API (anilist.co). Images/descriptions from AniList content sources. Generated for personal use.")
+    .build();
 
   await dictionary.setIndex(index);
 
-  // Limit parallel downloads to avoid spikes
+  // Limit parallel image downloads to avoid spikes
   const limit = pLimit(4);
 
   const entries = [...charMap.values()];
+  console.log(`Building terms for ${entries.length} characters…`);
 
   for (let i = 0; i < entries.length; i++) {
     const it = entries[i];
     const from = [...it.fromSet].slice(0, 6).join(", ");
 
-    const imgBase = `c_${i}_${Math.random().toString(16).slice(2)}`;
-    const localImgPath = path.join(tmpDir, `${imgBase}.jpg`);
-    const zipImgPath = `img/${imgBase}.jpg`;
-
-    const ok = await limit(() => downloadToFile(it.imageUrl, localImgPath));
-    if (ok) {
-      await dictionary.addFile(localImgPath, zipImgPath);
+    let imgDataUrl = "";
+    try {
+      imgDataUrl = await limit(() => imageUrlToDataUrl(it.imageUrl));
+    } catch {
+      imgDataUrl = "";
     }
 
-    const displayName = it.nameNative || it.nameFull;
+    const displayName = it.nameNative || it.nameFull || "";
     const html =
       `<div>` +
-      (ok ? `<div><img src="${zipImgPath}" style="max-width:220px;height:auto;border-radius:10px;"></div>` : ``) +
+      (imgDataUrl ? `<div><img src="${imgDataUrl}" style="max-width:220px;height:auto;border-radius:10px;"></div>` : ``) +
       `<div style="margin-top:6px;"><b>${displayName}</b></div>` +
       (it.nameNative && it.nameFull && it.nameNative !== it.nameFull ? `<div>(${it.nameFull})</div>` : ``) +
       (from ? `<div><i>From:</i> ${from}</div>` : ``) +
@@ -238,11 +257,10 @@ const index = new DictionaryIndex()
       `</div>`;
 
     const terms = makeAliases(it.nameNative, it.nameFull);
+
     for (const term of terms) {
-      const te = new TermEntry(term)
-        .addDetailedDefinition(html)
-        .build();
-      await dictionary.addTerm(te);
+      const teBuilt = buildTermEntry(term, html);
+      await dictionary.addTerm(teBuilt);
     }
   }
 
