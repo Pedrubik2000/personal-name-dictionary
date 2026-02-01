@@ -94,36 +94,33 @@ async function loadJmnedictSets() {
   // kanji spellings
   const kebRe = /<keb>([^<]+)<\/keb>/g;
 
-  // JMnedict name types are stored in <trans><type>...</type>
-  // There can be multiple <trans> blocks and multiple <type> entries.
-  const typeRe = /<type>([^<]+)<\/type>/g;
+  // JMnedict name categories are in <name_type> and usually contain entities like &given; &surname;
+  const nameTypeRe = /<name_type>([^<]+)<\/name_type>/g;
 
   let m;
   let count = 0;
-  let typeHits = 0;
+  let nameTypeHits = 0;
 
   while ((m = entryRe.exec(xml)) !== null) {
     const entry = m[1];
     count++;
 
     const types = new Set();
+
     let t;
-    while ((t = typeRe.exec(entry)) !== null) {
-      const v = String(t[1] || "").trim();
-      if (v) {
-        types.add(v);
-        typeHits++;
-      }
+    while ((t = nameTypeRe.exec(entry)) !== null) {
+      let v = String(t[1] || "").trim();
+      if (!v) continue;
+
+      // Normalize entity form: "&given;" -> "given"
+      if (v.startsWith("&") && v.endsWith(";")) v = v.slice(1, -1);
+
+      types.add(v);
+      nameTypeHits++;
     }
 
-    // We only care about names which are clearly surname/given.
-    // JMnedict uses tags like surname, given, fem, masc, person.
     const isSurname = types.has("surname") || types.has("family");
-    const isGiven =
-      types.has("given") ||
-      types.has("person") ||
-      types.has("fem") ||
-      types.has("masc");
+    const isGiven = types.has("given") || types.has("fem") || types.has("masc");
 
     if (!isSurname && !isGiven) continue;
 
@@ -138,10 +135,18 @@ async function loadJmnedictSets() {
     if (count % 20000 === 0) console.log(`…processed ${count} JMnedict entries`);
   }
 
-  console.log("JMnedict type tags found:", typeHits);
+  console.log("JMnedict name_type tags found:", nameTypeHits);
   console.log("JMnedict loaded:", { surnames: surnames.size, givennames: givennames.size });
+
+  if (surnames.size === 0 || givennames.size === 0) {
+    console.log("DEBUG: Example check — does XML contain '<name_type>'?", xml.includes("<name_type>"));
+    console.log("DEBUG: Example check — does XML contain '&given;'?", xml.includes("&given;"));
+    console.log("DEBUG: Example check — does XML contain '&surname;'?", xml.includes("&surname;"));
+  }
+
   return { surnames, givennames };
 }
+
 
 function bestSplitWithJmnedict(nativeKanji, jm) {
   const s = String(nativeKanji || "").trim();
