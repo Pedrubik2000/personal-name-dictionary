@@ -198,12 +198,14 @@ async function main() {
   const zipName = `anilist-characters-current-${userName}.zip`;
   const dictionary = new Dictionary({ fileName: zipName });
 
-  const index = new DictionaryIndex()
-    .setTitle(`AniList Characters (CURRENT) — ${userName}`)
-    .setRevision("1")
-    .setAuthor("AniList → Yomitan Generator (GitHub Actions)")
-    .setDescription("Character dictionary from AniList CURRENT only. Images bundled. Spoilers removed. Supports full + partial name lookup.")
-    .build();
+const index = new DictionaryIndex()
+  .setTitle(`AniList Characters (CURRENT) — ${userName}`)
+  .setRevision("1")
+  .setAuthor("AniList → Yomitan Generator (GitHub Actions)")
+  .setDescription("Character dictionary from AniList CURRENT only. Images bundled. Spoilers removed. Supports full + partial name lookup.")
+  .setAttribution("Data from AniList (anilist.co). Character images/descriptions provided by AniList content sources. Generated for personal use.")
+  .build();
+
 
   await dictionary.setIndex(index);
 
