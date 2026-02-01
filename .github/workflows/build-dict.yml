@@ -1,0 +1,56 @@
+name: Build AniList Yomitan Dictionary
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: "AniList username"
+        required: true
+        type: string
+      max_titles:
+        description: "Max titles (CURRENT only, total anime+manga)"
+        required: false
+        default: "50"
+        type: string
+      chars_per_title:
+        description: "Characters per title"
+        required: false
+        default: "12"
+        type: string
+      include_desc:
+        description: "Include descriptions (spoiler-cleaned)"
+        required: false
+        default: "true"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Build dictionary zip
+        env:
+          ANILIST_USER: ${{ inputs.username }}
+          MAX_TITLES: ${{ inputs.max_titles }}
+          CHARS_PER_TITLE: ${{ inputs.chars_per_title }}
+          INCLUDE_DESC: ${{ inputs.include_desc }}
+        run: npm run build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: anilist-yomitan-${{ inputs.username }}
+          path: out/*.zip
+          if-no-files-found: error
