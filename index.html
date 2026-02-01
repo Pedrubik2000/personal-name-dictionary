@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AniList → Yomitan Character Dictionary</title>
+  <title>AniList → Yomitan Character Dictionary (CURRENT only)</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 24px; max-width: 980px; }
     h1 { margin-bottom: 6px; }
@@ -26,7 +26,7 @@
 <body>
   <h1>AniList → Yomitan Character Dictionary</h1>
   <p class="muted">
-    CURRENT+PLANNING only • embedded images (resized) • spoiler-cleaned descriptions • lookup works for full + partial names
+    CURRENT only • embedded images (resized) • spoiler-cleaned descriptions • lookup works for full + partial names • auto backoff for 429
   </p>
 
   <div class="grid">
@@ -86,12 +86,8 @@
     });
 
     // -------- Basic UI helpers --------
-    function setLog(msg) {
-      document.getElementById("log").textContent = msg;
-    }
-    function log(msg) {
-      safeAppend(msg);
-    }
+    function setLog(msg) { document.getElementById("log").textContent = msg; }
+    function log(msg) { safeAppend(msg); }
     function setBusy(isBusy) {
       document.getElementById("btn").disabled = isBusy;
       document.getElementById("cancel").disabled = !isBusy;
@@ -106,7 +102,6 @@
     // -------- Core config --------
     const API = "https://graphql.anilist.co";
     let abortController = null;
-
     function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
     function escapeHtml(s) {
@@ -117,9 +112,7 @@
 
     function stripSpoilers(html) {
       if (!html) return "";
-      // Remove spoiler spans entirely
       html = html.replace(/<span[^>]*class="spoiler"[^>]*>[\s\S]*?<\/span>/gi, "[spoiler removed]");
-      // Remove leftover spoiler tokens
       html = html.replace(/\bspoiler\b/gi, "");
       return html;
     }
@@ -153,19 +146,49 @@
       return Array.from(aliases);
     }
 
+    // -------- GraphQL with automatic backoff for 429 --------
     async function gql(query, variables, signal) {
-      const res = await fetch(API, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({ query, variables }),
-        signal
-      });
-      const json = await res.json();
-      if (json.errors) throw new Error(json.errors.map(e => e.message).join("\n"));
-      return json.data;
+      let attempt = 0;
+
+      while (true) {
+        attempt++;
+
+        const res = await fetch(API, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
+          body: JSON.stringify({ query, variables }),
+          signal
+        });
+
+        // Hard rate limit
+        if (res.status === 429) {
+          const retryAfter = Number(res.headers.get("Retry-After") || "0");
+          const waitMs = (retryAfter > 0 ? retryAfter * 1000 : 4000) + Math.floor(Math.random() * 1200);
+          log(`Rate limited (429). Waiting ${Math.round(waitMs/1000)}s then retrying…`);
+          await sleep(waitMs);
+          if (attempt < 10) continue;
+          throw new Error("Too Many Requests (429). Try fewer titles or wait a bit and try again.");
+        }
+
+        const json = await res.json();
+
+        if (json.errors) {
+          const msg = json.errors.map(e => e.message).join("\n");
+          if (/too many requests/i.test(msg) || /rate limit/i.test(msg)) {
+            const waitMs = 4000 + Math.floor(Math.random() * 1200);
+            log(`Rate limit error. Waiting ${Math.round(waitMs/1000)}s then retrying…`);
+            await sleep(waitMs);
+            if (attempt < 10) continue;
+          }
+          throw new Error(msg);
+        }
+
+        return json.data;
+      }
     }
 
-    async function fetchCurrentAndPlanningTitles(userName, type, maxTitles, signal) {
+    // Fetch CURRENT titles for ANIME/MANGA (CURRENT ONLY)
+    async function fetchCurrentTitles(userName, type, maxTitles, signal) {
       const query = `
         query ($userName: String, $type: MediaType) {
           MediaListCollection(userName: $userName, type: $type) {
@@ -185,7 +208,7 @@
 
       const entries = (data?.MediaListCollection?.lists || [])
         .flatMap(l => l.entries || [])
-        .filter(e => e && (e.status === "CURRENT" || e.status === "PLANNING"));
+        .filter(e => e && e.status === "CURRENT"); // <-- CURRENT only
 
       const seen = new Set();
       const titles = [];
@@ -201,6 +224,7 @@
       return titles;
     }
 
+    // Fetch characters for a media (keeps BOTH native and full)
     async function fetchCharactersForMedia(mediaId, perPage, signal) {
       const query = `
         query ($id: Int, $perPage: Int) {
@@ -278,13 +302,14 @@
       return canvas.toDataURL("image/jpeg", quality);
     }
 
+    // ---- Yomitan packaging ----
     function buildYomitanFiles(dictTitle, items, enableAliases) {
       const index = {
         title: dictTitle,
         revision: "1",
         format: 3,
         author: "AniList → Yomitan Generator",
-        description: "Character dictionary (CURRENT+PLANNING). Embedded images, spoilers removed. Supports full + partial name lookup."
+        description: "Character dictionary (CURRENT only). Embedded images, spoilers removed. Supports full + partial name lookup."
       };
 
       const termBank = [];
@@ -358,10 +383,7 @@
       const includeDesc = document.getElementById("includeDesc").checked;
       const enableAliases = document.getElementById("enableAliases").checked;
 
-      if (!userName) {
-        log("Enter an AniList username.");
-        return;
-      }
+      if (!userName) { log("Enter an AniList username."); return; }
 
       setBusy(true);
       abortController = new AbortController();
@@ -372,17 +394,17 @@
         setProgress(1, "Fetching lists…");
 
         const [anime, manga] = await Promise.all([
-          fetchCurrentAndPlanningTitles(userName, "ANIME", maxTitles, signal),
-          fetchCurrentAndPlanningTitles(userName, "MANGA", maxTitles, signal)
+          fetchCurrentTitles(userName, "ANIME", maxTitles, signal),
+          fetchCurrentTitles(userName, "MANGA", maxTitles, signal)
         ]);
 
-        log(`Anime titles (CURRENT+PLANNING): ${anime.length}`);
-        log(`Manga titles (CURRENT+PLANNING): ${manga.length}`);
+        log(`Anime titles (CURRENT): ${anime.length}`);
+        log(`Manga titles (CURRENT): ${manga.length}`);
 
         const allTitles = [...anime, ...manga].slice(0, maxTitles);
         log(`Total titles used: ${allTitles.length}`);
 
-        if (allTitles.length === 0) throw new Error("No CURRENT or PLANNING entries found for that user.");
+        if (allTitles.length === 0) throw new Error("No CURRENT entries found for that user.");
 
         const charMap = new Map(); // characterId -> data
 
@@ -410,7 +432,8 @@
             charMap.get(key).fromSet.add(t.title);
           }
 
-          await sleep(180);
+          // Slower pacing to reduce 429
+          await sleep(600);
         }
 
         const rawItems = Array.from(charMap.values()).map(v => ({
@@ -451,11 +474,11 @@
         }
 
         setProgress(96, "Building dictionary files…");
-        const dictTitle = `AniList Characters (Current+Planning) — ${userName}`;
+        const dictTitle = `AniList Characters (CURRENT) — ${userName}`;
         const { index, termBank } = buildYomitanFiles(dictTitle, items, enableAliases);
 
         setProgress(98, "Zipping & downloading…");
-        await downloadZip(index, termBank, `anilist-characters-embedded-${userName}.zip`);
+        await downloadZip(index, termBank, `anilist-characters-current-embedded-${userName}.zip`);
 
         setProgress(100, "Done.");
         log("Downloaded ZIP. Import in Yomitan → Dictionaries → Import.");
@@ -470,7 +493,8 @@
 
     // Startup message
     setLog("JS loaded. Enter a username and click Build.");
-    log("If nothing happens, check the log for JSZip/network errors.");
+    log("Tip: If you still hit 429, lower Max titles or Characters/title.");
   </script>
 </body>
 </html>
+```0
