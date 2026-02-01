@@ -1,55 +1,51 @@
-name: Build AniList Yomitan Dictionary
+name: Build Yomitan Dictionary (AniList CURRENT)
 
 on:
   workflow_dispatch:
     inputs:
-      username:
+      anilist_user:
         description: "AniList username"
         required: true
-        type: string
+        default: "Pedrubik"
       max_titles:
-        description: "Max titles (CURRENT only)"
-        required: false
-        default: "50"
-        type: string
+        description: "Max total titles to use (anime+ manga CURRENT)"
+        required: true
+        default: "1"
       chars_per_title:
         description: "Characters per title"
-        required: false
+        required: true
         default: "12"
-        type: string
       include_desc:
-        description: "Include descriptions (spoiler-cleaned)"
-        required: false
+        description: "Include description text (spoiler-stripped)"
+        required: true
         default: "true"
-        type: string
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
+          cache: npm
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install
+        run: npm ci
 
-      - name: Build dictionary zip
+      - name: Build
         env:
-          ANILIST_USER: ${{ inputs.username }}
+          ANILIST_USER: ${{ inputs.anilist_user }}
           MAX_TITLES: ${{ inputs.max_titles }}
           CHARS_PER_TITLE: ${{ inputs.chars_per_title }}
           INCLUDE_DESC: ${{ inputs.include_desc }}
         run: npm run build
 
-      - name: Upload artifact
+      - name: Upload dictionary zip
         uses: actions/upload-artifact@v4
         with:
-          name: anilist-yomitan-${{ inputs.username }}
+          name: yomitan-dictionary
           path: out/*.zip
-          if-no-files-found: error
