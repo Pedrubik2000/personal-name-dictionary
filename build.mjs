@@ -10,8 +10,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const API = "https://graphql.anilist.co";
-
-// Stable HTTPS JMnedict location (EDRDG)
 const JMNEDICT_GZ_URL = "https://www.edrdg.org/pub/Nihongo/JMnedict.xml.gz";
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -73,17 +71,10 @@ async function fetchWithRetry(url, opts = {}, retries = 6) {
 }
 
 /**
- * Load JMnedict and extract sets:
- * - surnames: kanji expressions whose name_type includes surname/family
- * - givennames: kanji expressions whose name_type includes given/person/fem/masc
+ * JMnedict parser (regex) -> sets of kanji surnames + given names
  *
- * Implementation note:
- * JMnedict is large. Instead of a full XML DOM, we:
- *  - gunzip to string
- *  - iterate <entry>...</entry> blocks
- *  - regex out <keb> and <name_type>
- *
- * This is fast enough for Actions and avoids extra dependencies.
+ * IMPORTANT: JMnedict name categories are stored in <trans><type>...</type></trans>
+ * (NOT <name_type>).
  */
 async function loadJmnedictSets() {
   console.log("Downloading JMnedict.xml.gz…");
@@ -97,28 +88,36 @@ async function loadJmnedictSets() {
   const surnames = new Set();
   const givennames = new Set();
 
-  // Match entry blocks
+  // entry blocks
   const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
 
-  // Within an entry, keb (kanji) and name_type tags
+  // kanji spellings
   const kebRe = /<keb>([^<]+)<\/keb>/g;
-  const typeRe = /<name_type>([^<]+)<\/name_type>/g;
+
+  // JMnedict name types are stored in <trans><type>...</type>
+  // There can be multiple <trans> blocks and multiple <type> entries.
+  const typeRe = /<type>([^<]+)<\/type>/g;
 
   let m;
   let count = 0;
+  let typeHits = 0;
 
   while ((m = entryRe.exec(xml)) !== null) {
     const entry = m[1];
     count++;
 
-    // collect types
     const types = new Set();
     let t;
     while ((t = typeRe.exec(entry)) !== null) {
       const v = String(t[1] || "").trim();
-      if (v) types.add(v);
+      if (v) {
+        types.add(v);
+        typeHits++;
+      }
     }
 
+    // We only care about names which are clearly surname/given.
+    // JMnedict uses tags like surname, given, fem, masc, person.
     const isSurname = types.has("surname") || types.has("family");
     const isGiven =
       types.has("given") ||
@@ -136,10 +135,10 @@ async function loadJmnedictSets() {
       if (isGiven) givennames.add(kanji);
     }
 
-    // log occasionally so Actions doesn’t look frozen
     if (count % 20000 === 0) console.log(`…processed ${count} JMnedict entries`);
   }
 
+  console.log("JMnedict type tags found:", typeHits);
   console.log("JMnedict loaded:", { surnames: surnames.size, givennames: givennames.size });
   return { surnames, givennames };
 }
@@ -172,8 +171,6 @@ function bestSplitWithJmnedict(nativeKanji, jm) {
   return best ? { surname: best.surname, given: best.given } : null;
 }
 
-// Lookup terms: native, full, spaced parts (if any), romaji parts,
-// and JMnedict-validated surname/given split for no-space kanji names.
 function makeAliases(nameNative, nameFull, jm) {
   const aliases = new Set();
   const add = (s) => {
