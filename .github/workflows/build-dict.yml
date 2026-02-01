@@ -22,6 +22,11 @@ on:
         description: "Include description text (spoiler-stripped)"
         required: true
         default: "true"
+      use_jmnedict:
+        description: "Use JMnedict for kanji surname/given splits"
+        required: true
+        default: "true"
+
 
 jobs:
   build:
@@ -45,6 +50,7 @@ jobs:
           MAX_TITLES: ${{ inputs.max_titles }}
           CHARS_PER_TITLE: ${{ inputs.chars_per_title }}
           INCLUDE_DESC: ${{ inputs.include_desc }}
+          USE_JMNEDICT: ${{ inputs.use_jmnedict }}
         run: npm run build
 
       - name: Upload dictionary zip
