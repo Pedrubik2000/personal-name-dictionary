@@ -1,5 +1,8 @@
 name: Build Yomitan Dictionary (AniList CURRENT)
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -32,13 +35,10 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install
-        run: npm ci
-      - name: Generate package-lock.json if missing
-        run: |
-          npm install
-          git status
-      - name: Commit lock file
+      - name: Install and generate lock file
+        run: npm install
+      
+      - name: Commit package-lock.json (first run only)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
