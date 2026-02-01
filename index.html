@@ -3,33 +3,30 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AniList → Yomitan Character Dictionary (Embedded Images)</title>
+  <title>AniList → Yomitan Character Dictionary</title>
   <style>
     body { font-family: system-ui, sans-serif; margin: 24px; max-width: 980px; }
     h1 { margin-bottom: 6px; }
     .muted { color: #666; margin-top: 0; }
     .row { display:flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; align-items: center; }
-    input, button, select { font-size: 16px; padding: 8px 10px; }
+    input, button { font-size: 16px; padding: 8px 10px; }
     input[type="number"] { width: 110px; }
     button { cursor: pointer; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
-    #log { white-space: pre-wrap; background:#f5f5f5; padding: 12px; border-radius: 10px; min-height: 160px; }
+    #log { white-space: pre-wrap; background:#f5f5f5; padding: 12px; border-radius: 10px; min-height: 180px; }
     .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; }
     .grid { display:grid; grid-template-columns: 1fr; gap: 12px; }
-    @media (min-width: 860px) {
-      .grid { grid-template-columns: 1fr 1fr; }
-    }
+    @media (min-width: 860px) { .grid { grid-template-columns: 1fr 1fr; } }
     .progress-wrap { display:flex; gap: 10px; align-items: center; }
     progress { width: 320px; height: 18px; }
     .tiny { font-size: 13px; color: #666; }
-    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background: #eee; font-size: 12px; }
+    label { user-select: none; }
   </style>
 </head>
 <body>
   <h1>AniList → Yomitan Character Dictionary</h1>
   <p class="muted">
-    Builds an offline character-name dictionary with embedded images from <span class="pill">Watching/Reading + Planning</span>
-    and removes spoilers from descriptions.
+    CURRENT+PLANNING only • embedded images (resized) • spoiler-cleaned descriptions • lookup works for full + partial names
   </p>
 
   <div class="grid">
@@ -43,7 +40,7 @@
       <div class="row">
         <label>Max titles (total)</label>
         <input id="maxTitles" type="number" min="1" max="300" value="100" />
-        <label>Characters per title</label>
+        <label>Characters/title</label>
         <input id="charsPerTitle" type="number" min="1" max="50" value="15" />
       </div>
 
@@ -56,9 +53,7 @@
 
       <div class="row">
         <label><input id="includeDesc" type="checkbox" checked /> Include descriptions (spoiler-cleaned)</label>
-        <label title="Creates extra lookup terms: full name + parts + romaji full + romaji parts">
-          <input id="enableAliases" type="checkbox" checked /> Enable partial-name lookup (aliases)
-        </label>
+        <label><input id="enableAliases" type="checkbox" checked /> Enable partial-name lookup (aliases)</label>
       </div>
 
       <div class="progress-wrap row">
@@ -68,18 +63,35 @@
     </div>
 
     <div class="card">
-      <div id="log">Ready.</div>
+      <div id="log">Loading…</div>
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <!-- Use unpkg (often more reliable on mobile networks) -->
+  <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
+
   <script>
-    // ---- Config ----
-    const API = "https://graphql.anilist.co";
+    // -------- Visible error reporting (prints into #log) --------
+    function safeAppend(msg) {
+      const logEl = document.getElementById("log");
+      if (!logEl) return;
+      logEl.textContent += "\n" + msg;
+    }
 
-    let abortController = null;
+    window.addEventListener("error", (e) => {
+      safeAppend("\nJS ERROR:\n" + (e?.message || e?.error || e));
+    });
+    window.addEventListener("unhandledrejection", (e) => {
+      safeAppend("\nPROMISE ERROR:\n" + (e?.reason?.message || e?.reason || e));
+    });
 
-    // ---- UI helpers ----
+    // -------- Basic UI helpers --------
+    function setLog(msg) {
+      document.getElementById("log").textContent = msg;
+    }
+    function log(msg) {
+      safeAppend(msg);
+    }
     function setBusy(isBusy) {
       document.getElementById("btn").disabled = isBusy;
       document.getElementById("cancel").disabled = !isBusy;
@@ -90,31 +102,29 @@
       prog.value = Math.max(0, Math.min(100, pct));
       label.textContent = text || "";
     }
-    function setLog(msg) {
-      document.getElementById("log").textContent = msg;
-    }
-    function log(msg) {
-      document.getElementById("log").textContent += "\n" + msg;
-    }
 
-    // ---- Text helpers ----
+    // -------- Core config --------
+    const API = "https://graphql.anilist.co";
+    let abortController = null;
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
     function escapeHtml(s) {
       return String(s ?? "").replace(/[&<>"']/g, c => (
         { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]
       ));
     }
 
-    // Remove AniList spoiler spans
     function stripSpoilers(html) {
       if (!html) return "";
-      // Remove spoiler spans completely
+      // Remove spoiler spans entirely
       html = html.replace(/<span[^>]*class="spoiler"[^>]*>[\s\S]*?<\/span>/gi, "[spoiler removed]");
-      // Clean leftover "spoiler" tokens
+      // Remove leftover spoiler tokens
       html = html.replace(/\bspoiler\b/gi, "");
       return html;
     }
 
-    // Create lookup terms: full native, native parts, no-space native, full romaji, romaji parts
+    // Aliases = full native + native parts + no-space native + full romaji + romaji parts (+ lowercase romaji)
     function makeAliases(nameNative, nameFull) {
       const aliases = new Set();
 
@@ -130,14 +140,337 @@
 
       const splitParts = (s) =>
         String(s)
-          .split(/[\s・=＝·•\u30fb]+/g) // spaces, middle dots, etc.
+          .split(/[\s・=＝·•\u30fb]+/g)
           .map(x => x.trim())
           .filter(Boolean);
 
-      // Native parts (e.g. "竈門 炭治郎", "シンジ・イカリ")
-      for (const p of splitParts(nameNative)) {
-        // Avoid ultra-short junk
-        if (p.length >= 2) add(p);
+      for (const p of splitParts(nameNative)) if (p.length >= 2) add(p);
+      for (const p of splitParts(nameFull)) if (p.length >= 2) add(p);
+
+      if (nameNative) add(String(nameNative).replace(/\s+/g, ""));
+      if (nameFull) add(String(nameFull).toLowerCase());
+
+      return Array.from(aliases);
+    }
+
+    async function gql(query, variables, signal) {
+      const res = await fetch(API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({ query, variables }),
+        signal
+      });
+      const json = await res.json();
+      if (json.errors) throw new Error(json.errors.map(e => e.message).join("\n"));
+      return json.data;
+    }
+
+    async function fetchCurrentAndPlanningTitles(userName, type, maxTitles, signal) {
+      const query = `
+        query ($userName: String, $type: MediaType) {
+          MediaListCollection(userName: $userName, type: $type) {
+            lists {
+              entries {
+                status
+                media {
+                  id
+                  title { romaji english native }
+                }
+              }
+            }
+          }
+        }
+      `;
+      const data = await gql(query, { userName, type }, signal);
+
+      const entries = (data?.MediaListCollection?.lists || [])
+        .flatMap(l => l.entries || [])
+        .filter(e => e && (e.status === "CURRENT" || e.status === "PLANNING"));
+
+      const seen = new Set();
+      const titles = [];
+      for (const e of entries) {
+        const id = e.media?.id;
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const t = e.media?.title || {};
+        const title = t.english || t.romaji || t.native || String(id);
+        titles.push({ id, title, type });
+        if (titles.length >= maxTitles) break;
+      }
+      return titles;
+    }
+
+    async function fetchCharactersForMedia(mediaId, perPage, signal) {
+      const query = `
+        query ($id: Int, $perPage: Int) {
+          Media(id: $id) {
+            characters(page: 1, perPage: $perPage, sort: [RELEVANCE, ROLE]) {
+              edges {
+                role
+                node {
+                  id
+                  name { full native }
+                  image { large }
+                  description(asHtml: true)
+                }
+              }
+            }
+          }
+        }
+      `;
+      const data = await gql(query, { id: mediaId, perPage }, signal);
+      const edges = data?.Media?.characters?.edges || [];
+
+      return edges.map(ed => ({
+        id: ed?.node?.id,
+        nameNative: ed?.node?.name?.native || "",
+        nameFull: ed?.node?.name?.full || "",
+        imageUrl: ed?.node?.image?.large || "",
+        descriptionHtml: ed?.node?.description || ""
+      })).filter(c => c.id && (c.nameNative || c.nameFull));
+    }
+
+    // ---- Resize+embed images (JPEG) ----
+    function blobToImageElement(blob) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = URL.createObjectURL(blob);
+      });
+    }
+
+    async function fetchResizeToDataURL(url, targetWidth, quality, signal) {
+      if (!url) return "";
+      const res = await fetch(url, { mode: "cors", signal });
+      const blob = await res.blob();
+
+      let bitmap;
+      try {
+        bitmap = await createImageBitmap(blob);
+      } catch {
+        bitmap = await blobToImageElement(blob);
       }
 
-      //
+      const srcW = bitmap.width || bitmap.naturalWidth;
+      const srcH = bitmap.height || bitmap.naturalHeight;
+      if (!srcW || !srcH) return "";
+
+      const scale = targetWidth / srcW;
+      const dstW = Math.max(1, Math.round(srcW * scale));
+      const dstH = Math.max(1, Math.round(srcH * scale));
+
+      const canvas = document.createElement("canvas");
+      canvas.width = dstW;
+      canvas.height = dstH;
+      const ctx = canvas.getContext("2d", { alpha: false });
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+
+      if (bitmap instanceof HTMLImageElement) {
+        ctx.drawImage(bitmap, 0, 0, dstW, dstH);
+      } else {
+        ctx.drawImage(bitmap, 0, 0, dstW, dstH);
+        bitmap.close?.();
+      }
+
+      return canvas.toDataURL("image/jpeg", quality);
+    }
+
+    function buildYomitanFiles(dictTitle, items, enableAliases) {
+      const index = {
+        title: dictTitle,
+        revision: "1",
+        format: 3,
+        author: "AniList → Yomitan Generator",
+        description: "Character dictionary (CURRENT+PLANNING). Embedded images, spoilers removed. Supports full + partial name lookup."
+      };
+
+      const termBank = [];
+      let seq = 1;
+
+      for (const it of items) {
+        const displayName = it.nameNative || it.nameFull || "";
+
+        const html =
+          `<div>` +
+          (it.imageDataUrl
+            ? `<div><img src="${it.imageDataUrl}" style="max-width:220px;height:auto;border-radius:10px;" /></div>`
+            : ``) +
+          `<div style="margin-top:6px;"><b>${escapeHtml(displayName)}</b></div>` +
+          (it.nameNative && it.nameFull && it.nameNative !== it.nameFull
+            ? `<div class="tiny">(${escapeHtml(it.nameFull)})</div>`
+            : ``) +
+          (it.from ? `<div><i>From:</i> ${escapeHtml(it.from)}</div>` : ``) +
+          (it.descriptionHtml ? `<div style="margin-top:6px;">${it.descriptionHtml}</div>` : ``) +
+          `</div>`;
+
+        const terms = enableAliases
+          ? makeAliases(it.nameNative, it.nameFull)
+          : Array.from(new Set([it.nameNative, it.nameFull].filter(Boolean)));
+
+        for (const term of terms) {
+          termBank.push([
+            term,   // term
+            "",     // reading
+            "",     // partOfSpeech
+            "",     // rules
+            0,      // score
+            [html], // glossary
+            seq++,  // sequence
+            "",     // termTags
+            ""      // definitionTags
+          ]);
+        }
+      }
+
+      return { index, termBank };
+    }
+
+    async function downloadZip(indexObj, termBankArr, filename) {
+      if (!window.JSZip) throw new Error("JSZip did not load. Try switching networks or disabling adblock.");
+      const zip = new JSZip();
+      zip.file("index.json", JSON.stringify(indexObj, null, 2));
+      zip.file("term_bank_1.json", JSON.stringify(termBankArr));
+      const blob = await zip.generateAsync({ type: "blob" });
+
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    }
+
+    // -------- Wire up buttons --------
+    document.getElementById("cancel").addEventListener("click", () => {
+      if (abortController) abortController.abort();
+    });
+
+    document.getElementById("btn").addEventListener("click", async () => {
+      log("Build clicked!");
+
+      const userName = document.getElementById("username").value.trim();
+      const maxTitles = Math.max(1, Math.min(300, Number(document.getElementById("maxTitles").value || 100)));
+      const charsPerTitle = Math.max(1, Math.min(50, Number(document.getElementById("charsPerTitle").value || 15)));
+      const imgWidth = Math.max(64, Math.min(512, Number(document.getElementById("imgWidth").value || 220)));
+      const imgQuality = Math.max(0.3, Math.min(0.95, Number(document.getElementById("imgQuality").value || 0.75)));
+      const includeDesc = document.getElementById("includeDesc").checked;
+      const enableAliases = document.getElementById("enableAliases").checked;
+
+      if (!userName) {
+        log("Enter an AniList username.");
+        return;
+      }
+
+      setBusy(true);
+      abortController = new AbortController();
+      const signal = abortController.signal;
+
+      try {
+        setLog("Starting…");
+        setProgress(1, "Fetching lists…");
+
+        const [anime, manga] = await Promise.all([
+          fetchCurrentAndPlanningTitles(userName, "ANIME", maxTitles, signal),
+          fetchCurrentAndPlanningTitles(userName, "MANGA", maxTitles, signal)
+        ]);
+
+        log(`Anime titles (CURRENT+PLANNING): ${anime.length}`);
+        log(`Manga titles (CURRENT+PLANNING): ${manga.length}`);
+
+        const allTitles = [...anime, ...manga].slice(0, maxTitles);
+        log(`Total titles used: ${allTitles.length}`);
+
+        if (allTitles.length === 0) throw new Error("No CURRENT or PLANNING entries found for that user.");
+
+        const charMap = new Map(); // characterId -> data
+
+        for (let i = 0; i < allTitles.length; i++) {
+          if (signal.aborted) throw new Error("Cancelled.");
+
+          const t = allTitles[i];
+          setProgress(5 + Math.round((i / allTitles.length) * 55), `Fetching characters (${i+1}/${allTitles.length})…`);
+          log(`→ ${i+1}/${allTitles.length}: ${t.title}`);
+
+          const chars = await fetchCharactersForMedia(t.id, Math.min(50, charsPerTitle), signal);
+          const top = chars.slice(0, charsPerTitle);
+
+          for (const c of top) {
+            const key = String(c.id);
+            if (!charMap.has(key)) {
+              charMap.set(key, {
+                nameNative: c.nameNative,
+                nameFull: c.nameFull,
+                imageUrl: c.imageUrl,
+                descriptionHtml: includeDesc ? stripSpoilers(c.descriptionHtml) : "",
+                fromSet: new Set()
+              });
+            }
+            charMap.get(key).fromSet.add(t.title);
+          }
+
+          await sleep(180);
+        }
+
+        const rawItems = Array.from(charMap.values()).map(v => ({
+          nameNative: v.nameNative,
+          nameFull: v.nameFull,
+          imageUrl: v.imageUrl,
+          descriptionHtml: v.descriptionHtml,
+          from: Array.from(v.fromSet).slice(0, 6).join(", ")
+        }));
+
+        log(`Unique characters before embedding: ${rawItems.length}`);
+
+        setProgress(65, "Embedding/resizing images…");
+        const items = [];
+
+        for (let i = 0; i < rawItems.length; i++) {
+          if (signal.aborted) throw new Error("Cancelled.");
+
+          const it = rawItems[i];
+          setProgress(65 + Math.round((i / rawItems.length) * 30), `Embedding images (${i+1}/${rawItems.length})…`);
+
+          let imageDataUrl = "";
+          try {
+            imageDataUrl = await fetchResizeToDataURL(it.imageUrl, imgWidth, imgQuality, signal);
+          } catch {
+            imageDataUrl = "";
+          }
+
+          items.push({
+            nameNative: it.nameNative,
+            nameFull: it.nameFull,
+            imageDataUrl,
+            descriptionHtml: it.descriptionHtml,
+            from: it.from
+          });
+
+          if (i % 20 === 0) await sleep(0);
+        }
+
+        setProgress(96, "Building dictionary files…");
+        const dictTitle = `AniList Characters (Current+Planning) — ${userName}`;
+        const { index, termBank } = buildYomitanFiles(dictTitle, items, enableAliases);
+
+        setProgress(98, "Zipping & downloading…");
+        await downloadZip(index, termBank, `anilist-characters-embedded-${userName}.zip`);
+
+        setProgress(100, "Done.");
+        log("Downloaded ZIP. Import in Yomitan → Dictionaries → Import.");
+      } catch (e) {
+        log("\nERROR:\n" + (e?.message || e));
+        setProgress(0, "Stopped.");
+      } finally {
+        setBusy(false);
+        abortController = null;
+      }
+    });
+
+    // Startup message
+    setLog("JS loaded. Enter a username and click Build.");
+    log("If nothing happens, check the log for JSZip/network errors.");
+  </script>
+</body>
+</html>
