@@ -2,7 +2,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import fetch from "node-fetch";
 import pLimit from "p-limit";
 import { Dictionary, DictionaryIndex, TermEntry } from "yomichan-dict-builder";
 
@@ -13,7 +12,6 @@ const API = "https://graphql.anilist.co";
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// Remove AniList spoiler spans (we still keep the rest)
 function stripSpoilers(html) {
   if (!html) return "";
   return String(html)
@@ -21,7 +19,6 @@ function stripSpoilers(html) {
     .replace(/\bspoiler\b/gi, "");
 }
 
-// Convert AniList HTML to plain text (safe for structured content)
 function htmlToText(html) {
   if (!html) return "";
   return String(html)
@@ -37,10 +34,14 @@ function htmlToText(html) {
     .trim();
 }
 
-// Aliases so lookup works for full + partial (native and romaji)
+// lookup by: native, full, parts (space/・), plus some variants
 function makeAliases(nameNative, nameFull) {
   const aliases = new Set();
-  const add = (s) => { if (s && String(s).trim()) aliases.add(String(s).trim()); };
+  const add = (s) => {
+    if (!s) return;
+    const t = String(s).trim();
+    if (t) aliases.add(t);
+  };
 
   add(nameNative);
   add(nameFull);
@@ -54,70 +55,17 @@ function makeAliases(nameNative, nameFull) {
   for (const p of splitParts(nameNative)) if (p.length >= 2) add(p);
   for (const p of splitParts(nameFull)) if (p.length >= 2) add(p);
 
-  // helpful variants
   if (nameNative) add(String(nameNative).replace(/\s+/g, ""));
   if (nameFull) add(String(nameFull).toLowerCase());
 
   return [...aliases];
 }
 
-// Convert an image URL to an embedded data URL (base64)
-// Note: some Yomitan setups may not render data: images. If that happens,
-// we’ll need a builder version that supports adding files to the zip and reference by path.
-async function imageUrlToDataUrl(url) {
-  if (!url) return "";
-  const res = await fetch(url);
-  if (!res.ok) return "";
-  const buf = Buffer.from(await res.arrayBuffer());
-  const contentType = res.headers.get("content-type") || "image/jpeg";
-  const b64 = buf.toString("base64");
-  return `data:${contentType};base64,${b64}`;
-}
-
-// Structured content definition (NOT HTML string)
-// Prevents "<div>" showing up in Yomitan.
-function makeStructuredDefinition({ nameNative, nameFull, from, descriptionText, imgDataUrl }) {
-  const title = nameNative || nameFull || "";
-
-  return {
-    type: "structured-content",
-    content: {
-      tag: "div",
-      content: [
-        ...(imgDataUrl
-          ? [{
-              tag: "img",
-              src: imgDataUrl,
-              style: { maxWidth: "220px", height: "auto", borderRadius: "10px" }
-            }]
-          : []),
-        {
-          tag: "div",
-          style: { marginTop: "6px" },
-          content: [
-            { tag: "div", style: { fontWeight: "bold" }, content: title },
-            ...(nameNative && nameFull && nameNative !== nameFull
-              ? [{ tag: "div", style: { fontSize: "0.95em", opacity: 0.85 }, content: nameFull }]
-              : []),
-            ...(from
-              ? [{ tag: "div", style: { marginTop: "4px", fontSize: "0.92em", opacity: 0.9 }, content: `From: ${from}` }]
-              : []),
-            ...(descriptionText
-              ? [{ tag: "div", style: { marginTop: "6px" }, content: descriptionText }]
-              : [])
-          ]
-        }
-      ]
-    }
-  };
-}
-
-// GraphQL with rate-limit backoff
 async function gql(query, variables) {
-  for (let attempt = 1; attempt <= 12; attempt++) {
+  for (let attempt = 1; attempt <= 14; attempt++) {
     const res = await fetch(API, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify({ query, variables }),
     });
 
@@ -143,10 +91,9 @@ async function gql(query, variables) {
 
     return json.data;
   }
-  throw new Error("Too many rate-limit retries. Reduce limits or rerun later.");
+  throw new Error("Too many rate-limit retries. Reduce MAX_TITLES / CHARS_PER_TITLE and rerun.");
 }
 
-// CURRENT only list
 async function fetchCurrentTitles(userName, type, maxTitles) {
   const query = `
     query ($userName: String, $type: MediaType) {
@@ -193,7 +140,6 @@ async function fetchCharactersForMedia(mediaId, perTitle) {
   `;
   const data = await gql(query, { id: mediaId, perPage: perTitle });
   const edges = data?.Media?.characters?.edges || [];
-
   return edges
     .map(ed => ({
       id: ed?.node?.id,
@@ -205,25 +151,27 @@ async function fetchCharactersForMedia(mediaId, perTitle) {
     .filter(c => c.id && (c.nameNative || c.nameFull));
 }
 
-// Build term entry using whichever methods exist in your installed version
-function buildTermEntry(term, definitionObj) {
-  const te = new TermEntry(term);
+async function downloadToFile(url, filePath) {
+  if (!url) return null;
+  const res = await fetch(url);
+  if (!res.ok) return null;
+  const buf = Buffer.from(await res.arrayBuffer());
 
-  // Your installed version requires reading to be explicitly set.
-  if (typeof te.setReading === "function") te.setReading("");
-  else if (typeof te.setKana === "function") te.setKana("");
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, buf);
+  return filePath;
+}
 
-  // Pass a definition OBJECT (structured-content), not HTML strings.
-  if (typeof te.addDetailedDefinition === "function") return te.addDetailedDefinition(definitionObj).build();
-  if (typeof te.addDefinition === "function") return te.addDefinition(definitionObj).build();
-  if (typeof te.addGlossary === "function") return te.addGlossary(definitionObj).build();
-
-  throw new Error("Unsupported yomichan-dict-builder version: no known TermEntry definition method.");
+function guessExtFromUrl(url) {
+  const u = String(url || "").toLowerCase();
+  if (u.includes(".png")) return "png";
+  if (u.includes(".webp")) return "webp";
+  return "jpg";
 }
 
 async function main() {
   const userName = process.env.ANILIST_USER;
-  if (!userName) throw new Error("Missing ANILIST_USER env var");
+  if (!userName) throw new Error("Missing ANILIST_USER");
 
   const MAX_TITLES = Number(process.env.MAX_TITLES || "50");
   const CHARS_PER_TITLE = Number(process.env.CHARS_PER_TITLE || "12");
@@ -242,7 +190,7 @@ async function main() {
   console.log(`Titles used: ${titles.length} (anime ${anime.length}, manga ${manga.length})`);
   if (titles.length === 0) throw new Error("No CURRENT entries found.");
 
-  const charMap = new Map(); // characterId -> {.., fromSet}
+  const charMap = new Map(); // characterId -> data
 
   for (let i = 0; i < titles.length; i++) {
     const t = titles[i];
@@ -253,6 +201,7 @@ async function main() {
       const key = String(c.id);
       if (!charMap.has(key)) {
         charMap.set(key, {
+          id: key,
           nameNative: c.nameNative,
           nameFull: c.nameFull,
           imageUrl: c.imageUrl,
@@ -263,66 +212,80 @@ async function main() {
       charMap.get(key).fromSet.add(t.title);
     }
 
-    // pacing to reduce 429 risk
-    await sleep(450);
+    await sleep(450); // pacing
   }
 
   console.log("Unique characters:", charMap.size);
 
   const outDir = path.join(__dirname, "out");
+  const tmpDir = path.join(__dirname, "tmp");
   await fs.mkdir(outDir, { recursive: true });
+  await fs.mkdir(tmpDir, { recursive: true });
 
   const zipName = `anilist-characters-current-${userName}.zip`;
   const dictionary = new Dictionary({ fileName: zipName });
 
+  // README: attribution is required for Yomitan dictionaries; set it here. :contentReference[oaicite:3]{index=3}
   const index = new DictionaryIndex()
     .setTitle(`AniList Characters (CURRENT) — ${userName}`)
     .setRevision("1")
     .setAuthor("AniList → Yomitan Generator (GitHub Actions)")
-    .setDescription("Character dictionary from AniList CURRENT only. Structured content definitions. Spoilers removed. Supports full + partial name lookup.")
-    .setAttribution("Data via AniList GraphQL API (anilist.co). Images/descriptions from AniList content sources. Generated for personal use.")
+    .setDescription("Character dictionary from AniList CURRENT only. Images stored inside the dictionary. Spoilers removed. Supports name/full/partial lookup.")
+    .setAttribution("Data via AniList GraphQL API (anilist.co). Character images/descriptions from AniList sources. Generated for personal use.")
     .build();
 
   await dictionary.setIndex(index);
 
-  // Limit parallel image downloads to avoid spikes
-  const limit = pLimit(4);
+  const limitImg = pLimit(4);
+  let addedImages = 0;
 
-  const entries = [...charMap.values()];
-  console.log(`Building terms for ${entries.length} characters…`);
-
-  for (let i = 0; i < entries.length; i++) {
-    const it = entries[i];
+  for (const it of charMap.values()) {
     const from = [...it.fromSet].slice(0, 6).join(", ");
+    const displayName = it.nameNative || it.nameFull || "";
+    const aliases = makeAliases(it.nameNative, it.nameFull);
 
-    // Embedded image (data URL)
-    let imgDataUrl = "";
-    try {
-      imgDataUrl = await limit(() => imageUrlToDataUrl(it.imageUrl));
-    } catch {
-      imgDataUrl = "";
+    // Download image locally, then add to zip via addFile(local, zipPath). :contentReference[oaicite:4]{index=4}
+    let zipImgPath = "";
+    if (it.imageUrl) {
+      const ext = guessExtFromUrl(it.imageUrl);
+      const localImg = path.join(tmpDir, "img", `${it.id}.${ext}`);
+      const okPath = await limitImg(() => downloadToFile(it.imageUrl, localImg));
+      if (okPath) {
+        zipImgPath = `img/${it.id}.${ext}`;
+        await dictionary.addFile(okPath, zipImgPath); // (localPath, zipPath) :contentReference[oaicite:5]{index=5}
+        addedImages++;
+      }
     }
 
-    const descriptionText = it.descriptionHtml ? htmlToText(it.descriptionHtml) : "";
+    const descText = it.descriptionHtml ? htmlToText(it.descriptionHtml) : "";
 
-    const definitionObj = makeStructuredDefinition({
-      nameNative: it.nameNative,
-      nameFull: it.nameFull,
-      from,
-      descriptionText,
-      imgDataUrl
-    });
+    // Build definitions WITHOUT HTML.
+    // Use builder’s “detailed definitions” support. :contentReference[oaicite:6]{index=6}
+    for (const term of aliases) {
+      const entry = new TermEntry(term).setReading(term);
 
-    const terms = makeAliases(it.nameNative, it.nameFull);
+      if (zipImgPath) {
+        entry.addDetailedDefinition({ type: "image", path: zipImgPath });
+      }
 
-    for (const term of terms) {
-      const teBuilt = buildTermEntry(term, definitionObj);
-      await dictionary.addTerm(teBuilt);
+      const text =
+        [
+          displayName,
+          (it.nameNative && it.nameFull && it.nameNative !== it.nameFull) ? `Full: ${it.nameFull}` : "",
+          from ? `From: ${from}` : "",
+          descText ? `\n${descText}` : ""
+        ].filter(Boolean).join("\n");
+
+      entry.addDetailedDefinition({ type: "text", text });
+
+      await dictionary.addTerm(entry.build());
     }
   }
 
-  await dictionary.export(outDir);
-  console.log("Wrote:", path.join(outDir, zipName));
+  const stats = await dictionary.export(outDir);
+  console.log("Done exporting:", path.join(outDir, zipName));
+  console.log("Images added:", addedImages);
+  console.table(stats);
 }
 
 main().catch(e => {
