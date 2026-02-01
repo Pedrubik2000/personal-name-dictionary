@@ -2,13 +2,18 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import zlib from "node:zlib";
 import pLimit from "p-limit";
+import { SaxesParser } from "saxes";
 import { Dictionary, DictionaryIndex, TermEntry } from "yomichan-dict-builder";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const API = "https://graphql.anilist.co";
+
+// Official JMnedict distribution location (EDRDG) :contentReference[oaicite:1]{index=1}
+const JMNEDICT_GZ_URL = "https://ftp.edrdg.org/pub/Nihongo/JMnedict.xml.gz";
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -34,8 +39,138 @@ function htmlToText(html) {
     .trim();
 }
 
-// lookup by: native, full, parts (space/・), plus some variants
-function makeAliases(nameNative, nameFull) {
+function isAllCjk(s) {
+  return /^[\u3400-\u4DBF\u4E00-\u9FFF\u3005]+$/.test(String(s || "").trim());
+}
+
+function splitParts(s) {
+  return String(s || "")
+    .split(/[\s・=＝·•\u30fb]+/g)
+    .map(x => x.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Streaming JMnedict parser -> sets of kanji surnames + given names.
+ * We only keep <keb> strings from entries whose <name_type> indicates surname/given/etc.
+ *
+ * JMnedict docs + licensing: attribution/share-alike required. :contentReference[oaicite:2]{index=2}
+ */
+async function loadJmnedictSets() {
+  console.log("Downloading JMnedict.xml.gz…");
+  const res = await fetch(JMNEDICT_GZ_URL);
+  if (!res.ok) throw new Error(`JMnedict download failed: ${res.status}`);
+
+  const gzBuf = Buffer.from(await res.arrayBuffer());
+  const xmlBuf = zlib.gunzipSync(gzBuf);
+
+  console.log("Parsing JMnedict (stream)…");
+  const surnames = new Set();
+  const givennames = new Set();
+
+  const parser = new SaxesParser({ xmlns: false });
+
+  let text = "";
+  let inEntry = false;
+
+  /** @type {string[]} */
+  let kebs = [];
+  /** @type {Set<string>} */
+  let nameTypes = new Set();
+
+  // Track which element text belongs to
+  let currentTag = "";
+
+  parser.on("opentag", (node) => {
+    currentTag = node.name;
+    if (node.name === "entry") {
+      inEntry = true;
+      kebs = [];
+      nameTypes = new Set();
+    }
+    text = "";
+  });
+
+  parser.on("text", (t) => { text += t; });
+  parser.on("cdata", (t) => { text += t; });
+
+  parser.on("closetag", (tag) => {
+    const val = text.trim();
+    if (!inEntry) { text = ""; currentTag = ""; return; }
+
+    if (tag === "keb" && val) {
+      kebs.push(val);
+    }
+
+    if (tag === "name_type" && val) {
+      // JMnedict name_type values include things like "surname", "given", etc.
+      nameTypes.add(val);
+    }
+
+    if (tag === "entry") {
+      // Decide if this entry is a surname/given name entry
+      const isSurname = nameTypes.has("surname") || nameTypes.has("family");
+      const isGiven =
+        nameTypes.has("given") ||
+        nameTypes.has("person") ||
+        nameTypes.has("fem") ||
+        nameTypes.has("masc");
+
+      if (isSurname || isGiven) {
+        for (const k of kebs) {
+          if (!k || !isAllCjk(k)) continue;
+          if (isSurname) surnames.add(k);
+          if (isGiven) givennames.add(k);
+        }
+      }
+
+      inEntry = false;
+      kebs = [];
+      nameTypes = new Set();
+    }
+
+    text = "";
+    currentTag = "";
+  });
+
+  parser.write(xmlBuf.toString("utf8"));
+  parser.close();
+
+  console.log("JMnedict loaded:", { surnames: surnames.size, givennames: givennames.size });
+  return { surnames, givennames };
+}
+
+function bestSplitWithJmnedict(nativeKanji, jm) {
+  const s = String(nativeKanji || "").trim();
+  if (!s || !isAllCjk(s)) return null;
+
+  // Common name lengths; you can loosen this if needed
+  const chars = [...s];
+  const n = chars.length;
+  if (n < 2 || n > 8) return null;
+
+  let best = null;
+  for (let cut = 1; cut <= n - 1; cut++) {
+    const sur = chars.slice(0, cut).join("");
+    const giv = chars.slice(cut).join("");
+
+    if (!jm.surnames.has(sur)) continue;
+    if (!jm.givennames.has(giv)) continue;
+
+    // Prefer more typical surname lengths 2–3
+    let score = 100;
+    if (cut === 2) score += 15;
+    if (cut === 3) score += 8;
+    score += Math.min(5, sur.length) + Math.min(5, giv.length);
+
+    if (!best || score > best.score) best = { surname: sur, given: giv, score };
+  }
+  return best ? { surname: best.surname, given: best.given } : null;
+}
+
+// lookup by: native, full, parts (space/・), plus variants
+// + JMnedict validated splits for NO-SPACE kanji names like 綾瀬桃
+function makeAliases(nameNative, nameFull, jm) {
   const aliases = new Set();
   const add = (s) => {
     if (!s) return;
@@ -43,20 +178,41 @@ function makeAliases(nameNative, nameFull) {
     if (t) aliases.add(t);
   };
 
-  add(nameNative);
-  add(nameFull);
+  const native = String(nameNative || "").trim();
+  const full = String(nameFull || "").trim();
 
-  const splitParts = (s) =>
-    String(s || "")
-      .split(/[\s・=＝·•\u30fb]+/g)
-      .map(x => x.trim())
-      .filter(Boolean);
+  // originals
+  add(native);
+  add(full);
 
-  for (const p of splitParts(nameNative)) if (p.length >= 2) add(p);
-  for (const p of splitParts(nameFull)) if (p.length >= 2) add(p);
+  // normalizations
+  if (native) {
+    add(native.replace(/\s+/g, ""));
+    add(native.replace(/[\s\u30fb]+/g, "")); // remove spaces + ・
+  }
+  if (full) add(full.toLowerCase());
 
-  if (nameNative) add(String(nameNative).replace(/\s+/g, ""));
-  if (nameFull) add(String(nameFull).toLowerCase());
+  // safe splits when separators exist
+  const nativeParts = splitParts(native);
+  if (nativeParts.length >= 2) {
+    for (const p of nativeParts) add(p); // allow 1-kanji too; you asked for near-perfect + useful
+  } else if (jm && native && isAllCjk(native)) {
+    // near-perfect split when no separators
+    const sp = bestSplitWithJmnedict(native, jm);
+    if (sp) {
+      add(sp.surname);
+      add(sp.given);
+    }
+  }
+
+  // romaji/full parts (optional convenience)
+  const fullParts = splitParts(full);
+  if (fullParts.length >= 2) {
+    for (const p of fullParts) {
+      add(p);
+      add(p.toLowerCase());
+    }
+  }
 
   return [...aliases];
 }
@@ -177,8 +333,16 @@ async function main() {
   const CHARS_PER_TITLE = Number(process.env.CHARS_PER_TITLE || "12");
   const INCLUDE_DESC = (process.env.INCLUDE_DESC || "true") === "true";
 
+  const USE_JMNEDICT = (process.env.USE_JMNEDICT || "true") === "true";
+
   console.log("User:", userName);
   console.log("MAX_TITLES:", MAX_TITLES, "CHARS_PER_TITLE:", CHARS_PER_TITLE, "INCLUDE_DESC:", INCLUDE_DESC);
+  console.log("USE_JMNEDICT:", USE_JMNEDICT);
+
+  let jm = null;
+  if (USE_JMNEDICT) {
+    jm = await loadJmnedictSets();
+  }
 
   console.log("Fetching CURRENT lists…");
   const [anime, manga] = await Promise.all([
@@ -212,7 +376,7 @@ async function main() {
       charMap.get(key).fromSet.add(t.title);
     }
 
-    await sleep(450); // pacing
+    await sleep(450);
   }
 
   console.log("Unique characters:", charMap.size);
@@ -225,13 +389,17 @@ async function main() {
   const zipName = `anilist-characters-current-${userName}.zip`;
   const dictionary = new Dictionary({ fileName: zipName });
 
-  // README: attribution is required for Yomitan dictionaries; set it here. :contentReference[oaicite:3]{index=3}
+  // Add attribution including JMnedict if enabled (EDRDG requires attribution/share-alike) :contentReference[oaicite:3]{index=3}
+  const attribution = USE_JMNEDICT
+    ? "Data via AniList GraphQL API (anilist.co). Character images/descriptions from AniList sources. Name splitting aided by JMnedict (EDRDG) under the EDRDG dictionary licence (attribution + share-alike)."
+    : "Data via AniList GraphQL API (anilist.co). Character images/descriptions from AniList sources. Generated for personal use.";
+
   const index = new DictionaryIndex()
     .setTitle(`AniList Characters (CURRENT) — ${userName}`)
     .setRevision("1")
     .setAuthor("AniList → Yomitan Generator (GitHub Actions)")
-    .setDescription("Character dictionary from AniList CURRENT only. Images stored inside the dictionary. Spoilers removed. Supports name/full/partial lookup.")
-    .setAttribution("Data via AniList GraphQL API (anilist.co). Character images/descriptions from AniList sources. Generated for personal use.")
+    .setDescription("Character dictionary from AniList CURRENT only. Images stored inside the dictionary. Spoilers removed. Supports name/full/partial lookup (JMnedict split for kanji names).")
+    .setAttribution(attribution)
     .build();
 
   await dictionary.setIndex(index);
@@ -242,9 +410,8 @@ async function main() {
   for (const it of charMap.values()) {
     const from = [...it.fromSet].slice(0, 6).join(", ");
     const displayName = it.nameNative || it.nameFull || "";
-    const aliases = makeAliases(it.nameNative, it.nameFull);
+    const aliases = makeAliases(it.nameNative, it.nameFull, jm);
 
-    // Download image locally, then add to zip via addFile(local, zipPath). :contentReference[oaicite:4]{index=4}
     let zipImgPath = "";
     if (it.imageUrl) {
       const ext = guessExtFromUrl(it.imageUrl);
@@ -252,21 +419,18 @@ async function main() {
       const okPath = await limitImg(() => downloadToFile(it.imageUrl, localImg));
       if (okPath) {
         zipImgPath = `img/${it.id}.${ext}`;
-        await dictionary.addFile(okPath, zipImgPath); // (localPath, zipPath) :contentReference[oaicite:5]{index=5}
+        await dictionary.addFile(okPath, zipImgPath);
         addedImages++;
       }
     }
 
     const descText = it.descriptionHtml ? htmlToText(it.descriptionHtml) : "";
 
-    // Build definitions WITHOUT HTML.
-    // Use builder’s “detailed definitions” support. :contentReference[oaicite:6]{index=6}
     for (const term of aliases) {
-      const entry = new TermEntry(term).setReading(term);
+      // Keep reading blank for names if you prefer; using term is also fine.
+      const entry = new TermEntry(term).setReading("");
 
-      if (zipImgPath) {
-        entry.addDetailedDefinition({ type: "image", path: zipImgPath });
-      }
+      if (zipImgPath) entry.addDetailedDefinition({ type: "image", path: zipImgPath });
 
       const text =
         [
@@ -277,7 +441,6 @@ async function main() {
         ].filter(Boolean).join("\n");
 
       entry.addDetailedDefinition({ type: "text", text });
-
       await dictionary.addTerm(entry.build());
     }
   }
