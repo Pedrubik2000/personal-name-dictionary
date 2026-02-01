@@ -344,14 +344,19 @@ async function main() {
     jm = await loadJmnedictSets();
   }
 
-  console.log("Fetching CURRENT lists…");
-  const [anime, manga] = await Promise.all([
-    fetchCurrentTitles(userName, "ANIME", MAX_TITLES),
-    fetchCurrentTitles(userName, "MANGA", MAX_TITLES),
-  ]);
+  console.log("Fetching CURRENT MANGA list…");
+  
+  // If you truly want *everything* CURRENT, ignore MAX_TITLES by passing a huge number.
+  // AniList still pages internally; this just caps your own list.
+  const MANGA_CAP = Number(process.env.MANGA_CAP || "99999");
+  
+  const manga = await fetchCurrentTitles(userName, "MANGA", MANGA_CAP);
+  
+  const titles = manga; // manga only
+  console.log(`Titles used: ${titles.length} (manga only)`);
+  if (titles.length === 0) throw new Error("No CURRENT manga entries found.");
 
-  const titles = [...anime, ...manga].slice(0, MAX_TITLES);
-  console.log(`Titles used: ${titles.length} (anime ${anime.length}, manga ${manga.length})`);
+  
   if (titles.length === 0) throw new Error("No CURRENT entries found.");
 
   const charMap = new Map();
