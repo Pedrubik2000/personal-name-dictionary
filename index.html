@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AniList → Yomitan Character Dictionary (Embedded Images)</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; max-width: 980px; }
+    h1 { margin-bottom: 6px; }
+    .muted { color: #666; margin-top: 0; }
+    .row { display:flex; gap: 12px; flex-wrap: wrap; margin: 12px 0; align-items: center; }
+    input, button, select { font-size: 16px; padding: 8px 10px; }
+    input[type="number"] { width: 110px; }
+    button { cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    #log { white-space: pre-wrap; background:#f5f5f5; padding: 12px; border-radius: 10px; min-height: 160px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; }
+    .grid { display:grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 860px) {
+      .grid { grid-template-columns: 1fr 1fr; }
+    }
+    .progress-wrap { display:flex; gap: 10px; align-items: center; }
+    progress { width: 320px; height: 18px; }
+    .tiny { font-size: 13px; color: #666; }
+    .pill { display:inline-block; padding: 2px 8px; border-radius: 999px; background: #eee; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>AniList → Yomitan Character Dictionary</h1>
+  <p class="muted">
+    Builds an offline character-name dictionary with embedded images from <span class="pill">Watching/Reading + Planning</span>
+    and removes spoilers from descriptions.
+  </p>
+
+  <div class="grid">
+    <div class="card">
+      <div class="row">
+        <input id="username" placeholder="AniList username" style="min-width: 240px;" />
+        <button id="btn">Build dictionary ZIP</button>
+        <button id="cancel" disabled>Cancel</button>
+      </div>
+
+      <div class="row">
+        <label>Max titles (total)</label>
+        <input id="maxTitles" type="number" min="1" max="300" value="100" />
+        <label>Characters per title</label>
+        <input id="charsPerTitle" type="number" min="1" max="50" value="15" />
+      </div>
+
+      <div class="row">
+        <label>Image width</label>
+        <input id="imgWidth" type="number" min="64" max="512" value="220" />
+        <label>JPEG quality</label>
+        <input id="imgQuality" type="number" min="0.3" max="0.95" step="0.05" value="0.75" />
+      </div>
+
+      <div class="row">
+        <label><input id="includeDesc" type="checkbox" checked /> Include descriptions (spoiler-cleaned)</label>
+        <label title="Creates extra lookup terms: full name + parts + romaji full + romaji parts">
+          <input id="enableAliases" type="checkbox" checked /> Enable partial-name lookup (aliases)
+        </label>
+      </div>
+
+      <div class="progress-wrap row">
+        <progress id="progress" value="0" max="100"></progress>
+        <span id="progressText" class="tiny">Ready.</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div id="log">Ready.</div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script>
+    // ---- Config ----
+    const API = "https://graphql.anilist.co";
+
+    let abortController = null;
+
+    // ---- UI helpers ----
+    function setBusy(isBusy) {
+      document.getElementById("btn").disabled = isBusy;
+      document.getElementById("cancel").disabled = !isBusy;
+    }
+    function setProgress(pct, text) {
+      const prog = document.getElementById("progress");
+      const label = document.getElementById("progressText");
+      prog.value = Math.max(0, Math.min(100, pct));
+      label.textContent = text || "";
+    }
+    function setLog(msg) {
+      document.getElementById("log").textContent = msg;
+    }
+    function log(msg) {
+      document.getElementById("log").textContent += "\n" + msg;
+    }
+
+    // ---- Text helpers ----
+    function escapeHtml(s) {
+      return String(s ?? "").replace(/[&<>"']/g, c => (
+        { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]
+      ));
+    }
+
+    // Remove AniList spoiler spans
+    function stripSpoilers(html) {
+      if (!html) return "";
+      // Remove spoiler spans completely
+      html = html.replace(/<span[^>]*class="spoiler"[^>]*>[\s\S]*?<\/span>/gi, "[spoiler removed]");
+      // Clean leftover "spoiler" tokens
+      html = html.replace(/\bspoiler\b/gi, "");
+      return html;
+    }
+
+    // Create lookup terms: full native, native parts, no-space native, full romaji, romaji parts
+    function makeAliases(nameNative, nameFull) {
+      const aliases = new Set();
+
+      const add = (s) => {
+        if (!s) return;
+        s = String(s).trim();
+        if (!s) return;
+        aliases.add(s);
+      };
+
+      add(nameNative);
+      add(nameFull);
+
+      const splitParts = (s) =>
+        String(s)
+          .split(/[\s・=＝·•\u30fb]+/g) // spaces, middle dots, etc.
+          .map(x => x.trim())
+          .filter(Boolean);
+
+      // Native parts (e.g. "竈門 炭治郎", "シンジ・イカリ")
+      for (const p of splitParts(nameNative)) {
+        // Avoid ultra-short junk
+        if (p.length >= 2) add(p);
+      }
+
+      //
