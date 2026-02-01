@@ -5,19 +5,14 @@ import { fileURLToPath } from "node:url";
 import zlib from "node:zlib";
 import pLimit from "p-limit";
 import { Dictionary, DictionaryIndex, TermEntry } from "yomichan-dict-builder";
-import os from "node:os";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const execFileAsync = promisify(execFile);
 
 const API = "https://graphql.anilist.co";
 
-// Official JMnedict distribution location (EDRDG) :contentReference[oaicite:1]{index=1}
+// Stable HTTPS JMnedict location (EDRDG)
 const JMNEDICT_GZ_URL = "https://www.edrdg.org/pub/Nihongo/JMnedict.xml.gz";
-
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -54,7 +49,7 @@ function splitParts(s) {
     .filter(Boolean);
 }
 
-async function fetchWithRetry(url, opts = {}, retries = 5) {
+async function fetchWithRetry(url, opts = {}, retries = 6) {
   let lastErr;
   for (let i = 0; i < retries; i++) {
     try {
@@ -69,116 +64,96 @@ async function fetchWithRetry(url, opts = {}, retries = 5) {
       return res;
     } catch (e) {
       lastErr = e;
-      const wait = 1500 * (i + 1) + Math.floor(Math.random() * 800);
-      console.log(`JMnedict fetch retry ${i + 1}/${retries} after ${Math.round(wait/1000)}s… (${e.message})`);
+      const wait = 1500 * (i + 1) + Math.floor(Math.random() * 900);
+      console.log(`JMnedict fetch retry ${i + 1}/${retries} after ${Math.round(wait / 1000)}s… (${e.message})`);
       await sleep(wait);
     }
   }
   throw lastErr;
 }
 
-
 /**
- * Streaming JMnedict parser -> sets of kanji surnames + given names.
- * We only keep <keb> strings from entries whose <name_type> indicates surname/given/etc.
+ * Load JMnedict and extract sets:
+ * - surnames: kanji expressions whose name_type includes surname/family
+ * - givennames: kanji expressions whose name_type includes given/person/fem/masc
  *
- * JMnedict docs + licensing: attribution/share-alike required. :contentReference[oaicite:2]{index=2}
+ * Implementation note:
+ * JMnedict is large. Instead of a full XML DOM, we:
+ *  - gunzip to string
+ *  - iterate <entry>...</entry> blocks
+ *  - regex out <keb> and <name_type>
+ *
+ * This is fast enough for Actions and avoids extra dependencies.
  */
 async function loadJmnedictSets() {
   console.log("Downloading JMnedict.xml.gz…");
   const res = await fetchWithRetry(JMNEDICT_GZ_URL);
-  if (!res.ok) throw new Error(`JMnedict download failed: ${res.status}`);
-
   const gzBuf = Buffer.from(await res.arrayBuffer());
-  const xmlBuf = zlib.gunzipSync(gzBuf);
 
-  console.log("Parsing JMnedict (stream)…");
+  console.log("Decompressing JMnedict…");
+  const xml = zlib.gunzipSync(gzBuf).toString("utf8");
+
+  console.log("Extracting surname/given name sets from JMnedict…");
   const surnames = new Set();
   const givennames = new Set();
 
-  const parser = new SaxesParser({ xmlns: false });
+  // Match entry blocks
+  const entryRe = /<entry>([\s\S]*?)<\/entry>/g;
 
-  let text = "";
-  let inEntry = false;
+  // Within an entry, keb (kanji) and name_type tags
+  const kebRe = /<keb>([^<]+)<\/keb>/g;
+  const typeRe = /<name_type>([^<]+)<\/name_type>/g;
 
-  /** @type {string[]} */
-  let kebs = [];
-  /** @type {Set<string>} */
-  let nameTypes = new Set();
+  let m;
+  let count = 0;
 
-  // Track which element text belongs to
-  let currentTag = "";
+  while ((m = entryRe.exec(xml)) !== null) {
+    const entry = m[1];
+    count++;
 
-  parser.on("opentag", (node) => {
-    currentTag = node.name;
-    if (node.name === "entry") {
-      inEntry = true;
-      kebs = [];
-      nameTypes = new Set();
-    }
-    text = "";
-  });
-
-  parser.on("text", (t) => { text += t; });
-  parser.on("cdata", (t) => { text += t; });
-
-  parser.on("closetag", (tag) => {
-    const val = text.trim();
-    if (!inEntry) { text = ""; currentTag = ""; return; }
-
-    if (tag === "keb" && val) {
-      kebs.push(val);
+    // collect types
+    const types = new Set();
+    let t;
+    while ((t = typeRe.exec(entry)) !== null) {
+      const v = String(t[1] || "").trim();
+      if (v) types.add(v);
     }
 
-    if (tag === "name_type" && val) {
-      // JMnedict name_type values include things like "surname", "given", etc.
-      nameTypes.add(val);
+    const isSurname = types.has("surname") || types.has("family");
+    const isGiven =
+      types.has("given") ||
+      types.has("person") ||
+      types.has("fem") ||
+      types.has("masc");
+
+    if (!isSurname && !isGiven) continue;
+
+    let k;
+    while ((k = kebRe.exec(entry)) !== null) {
+      const kanji = String(k[1] || "").trim();
+      if (!kanji || !isAllCjk(kanji)) continue;
+      if (isSurname) surnames.add(kanji);
+      if (isGiven) givennames.add(kanji);
     }
 
-    if (tag === "entry") {
-      // Decide if this entry is a surname/given name entry
-      const isSurname = nameTypes.has("surname") || nameTypes.has("family");
-      const isGiven =
-        nameTypes.has("given") ||
-        nameTypes.has("person") ||
-        nameTypes.has("fem") ||
-        nameTypes.has("masc");
-
-      if (isSurname || isGiven) {
-        for (const k of kebs) {
-          if (!k || !isAllCjk(k)) continue;
-          if (isSurname) surnames.add(k);
-          if (isGiven) givennames.add(k);
-        }
-      }
-
-      inEntry = false;
-      kebs = [];
-      nameTypes = new Set();
-    }
-
-    text = "";
-    currentTag = "";
-  });
-
-  parser.write(xmlBuf.toString("utf8"));
-  parser.close();
+    // log occasionally so Actions doesn’t look frozen
+    if (count % 20000 === 0) console.log(`…processed ${count} JMnedict entries`);
+  }
 
   console.log("JMnedict loaded:", { surnames: surnames.size, givennames: givennames.size });
   return { surnames, givennames };
 }
 
-
 function bestSplitWithJmnedict(nativeKanji, jm) {
   const s = String(nativeKanji || "").trim();
   if (!s || !isAllCjk(s)) return null;
 
-  // Common name lengths; you can loosen this if needed
   const chars = [...s];
   const n = chars.length;
   if (n < 2 || n > 8) return null;
 
   let best = null;
+
   for (let cut = 1; cut <= n - 1; cut++) {
     const sur = chars.slice(0, cut).join("");
     const giv = chars.slice(cut).join("");
@@ -186,7 +161,6 @@ function bestSplitWithJmnedict(nativeKanji, jm) {
     if (!jm.surnames.has(sur)) continue;
     if (!jm.givennames.has(giv)) continue;
 
-    // Prefer more typical surname lengths 2–3
     let score = 100;
     if (cut === 2) score += 15;
     if (cut === 3) score += 8;
@@ -194,11 +168,12 @@ function bestSplitWithJmnedict(nativeKanji, jm) {
 
     if (!best || score > best.score) best = { surname: sur, given: giv, score };
   }
+
   return best ? { surname: best.surname, given: best.given } : null;
 }
 
-// lookup by: native, full, parts (space/・), plus variants
-// + JMnedict validated splits for NO-SPACE kanji names like 綾瀬桃
+// Lookup terms: native, full, spaced parts (if any), romaji parts,
+// and JMnedict-validated surname/given split for no-space kanji names.
 function makeAliases(nameNative, nameFull, jm) {
   const aliases = new Set();
   const add = (s) => {
@@ -210,23 +185,19 @@ function makeAliases(nameNative, nameFull, jm) {
   const native = String(nameNative || "").trim();
   const full = String(nameFull || "").trim();
 
-  // originals
   add(native);
   add(full);
 
-  // normalizations
   if (native) {
     add(native.replace(/\s+/g, ""));
-    add(native.replace(/[\s\u30fb]+/g, "")); // remove spaces + ・
+    add(native.replace(/[\s\u30fb]+/g, ""));
   }
   if (full) add(full.toLowerCase());
 
-  // safe splits when separators exist
   const nativeParts = splitParts(native);
   if (nativeParts.length >= 2) {
-    for (const p of nativeParts) add(p); // allow 1-kanji too; you asked for near-perfect + useful
+    for (const p of nativeParts) add(p);
   } else if (jm && native && isAllCjk(native)) {
-    // near-perfect split when no separators
     const sp = bestSplitWithJmnedict(native, jm);
     if (sp) {
       add(sp.surname);
@@ -234,7 +205,6 @@ function makeAliases(nameNative, nameFull, jm) {
     }
   }
 
-  // romaji/full parts (optional convenience)
   const fullParts = splitParts(full);
   if (fullParts.length >= 2) {
     for (const p of fullParts) {
@@ -361,7 +331,6 @@ async function main() {
   const MAX_TITLES = Number(process.env.MAX_TITLES || "50");
   const CHARS_PER_TITLE = Number(process.env.CHARS_PER_TITLE || "12");
   const INCLUDE_DESC = (process.env.INCLUDE_DESC || "true") === "true";
-
   const USE_JMNEDICT = (process.env.USE_JMNEDICT || "true") === "true";
 
   console.log("User:", userName);
@@ -383,7 +352,7 @@ async function main() {
   console.log(`Titles used: ${titles.length} (anime ${anime.length}, manga ${manga.length})`);
   if (titles.length === 0) throw new Error("No CURRENT entries found.");
 
-  const charMap = new Map(); // characterId -> data
+  const charMap = new Map();
 
   for (let i = 0; i < titles.length; i++) {
     const t = titles[i];
@@ -418,7 +387,6 @@ async function main() {
   const zipName = `anilist-characters-current-${userName}.zip`;
   const dictionary = new Dictionary({ fileName: zipName });
 
-  // Add attribution including JMnedict if enabled (EDRDG requires attribution/share-alike) :contentReference[oaicite:3]{index=3}
   const attribution = USE_JMNEDICT
     ? "Data via AniList GraphQL API (anilist.co). Character images/descriptions from AniList sources. Name splitting aided by JMnedict (EDRDG) under the EDRDG dictionary licence (attribution + share-alike)."
     : "Data via AniList GraphQL API (anilist.co). Character images/descriptions from AniList sources. Generated for personal use.";
@@ -456,7 +424,6 @@ async function main() {
     const descText = it.descriptionHtml ? htmlToText(it.descriptionHtml) : "";
 
     for (const term of aliases) {
-      // Keep reading blank for names if you prefer; using term is also fine.
       const entry = new TermEntry(term).setReading("");
 
       if (zipImgPath) entry.addDetailedDefinition({ type: "image", path: zipImgPath });
