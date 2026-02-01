@@ -13,11 +13,28 @@ const API = "https://graphql.anilist.co";
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// Remove AniList spoiler spans (we still keep the rest)
 function stripSpoilers(html) {
   if (!html) return "";
   return String(html)
     .replace(/<span[^>]*class="spoiler"[^>]*>[\s\S]*?<\/span>/gi, "[spoiler removed]")
     .replace(/\bspoiler\b/gi, "");
+}
+
+// Convert AniList HTML to plain text (safe for structured content)
+function htmlToText(html) {
+  if (!html) return "";
+  return String(html)
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
 }
 
 // Aliases so lookup works for full + partial (native and romaji)
@@ -37,6 +54,7 @@ function makeAliases(nameNative, nameFull) {
   for (const p of splitParts(nameNative)) if (p.length >= 2) add(p);
   for (const p of splitParts(nameFull)) if (p.length >= 2) add(p);
 
+  // helpful variants
   if (nameNative) add(String(nameNative).replace(/\s+/g, ""));
   if (nameFull) add(String(nameFull).toLowerCase());
 
@@ -44,7 +62,8 @@ function makeAliases(nameNative, nameFull) {
 }
 
 // Convert an image URL to an embedded data URL (base64)
-// This avoids dictionary.addFile() API differences across library versions.
+// Note: some Yomitan setups may not render data: images. If that happens,
+// we’ll need a builder version that supports adding files to the zip and reference by path.
 async function imageUrlToDataUrl(url) {
   if (!url) return "";
   const res = await fetch(url);
@@ -53,6 +72,44 @@ async function imageUrlToDataUrl(url) {
   const contentType = res.headers.get("content-type") || "image/jpeg";
   const b64 = buf.toString("base64");
   return `data:${contentType};base64,${b64}`;
+}
+
+// Structured content definition (NOT HTML string)
+// Prevents "<div>" showing up in Yomitan.
+function makeStructuredDefinition({ nameNative, nameFull, from, descriptionText, imgDataUrl }) {
+  const title = nameNative || nameFull || "";
+
+  return {
+    type: "structured-content",
+    content: {
+      tag: "div",
+      content: [
+        ...(imgDataUrl
+          ? [{
+              tag: "img",
+              src: imgDataUrl,
+              style: { maxWidth: "220px", height: "auto", borderRadius: "10px" }
+            }]
+          : []),
+        {
+          tag: "div",
+          style: { marginTop: "6px" },
+          content: [
+            { tag: "div", style: { fontWeight: "bold" }, content: title },
+            ...(nameNative && nameFull && nameNative !== nameFull
+              ? [{ tag: "div", style: { fontSize: "0.95em", opacity: 0.85 }, content: nameFull }]
+              : []),
+            ...(from
+              ? [{ tag: "div", style: { marginTop: "4px", fontSize: "0.92em", opacity: 0.9 }, content: `From: ${from}` }]
+              : []),
+            ...(descriptionText
+              ? [{ tag: "div", style: { marginTop: "6px" }, content: descriptionText }]
+              : [])
+          ]
+        }
+      ]
+    }
+  };
 }
 
 // GraphQL with rate-limit backoff
@@ -67,7 +124,7 @@ async function gql(query, variables) {
     if (res.status === 429) {
       const retryAfter = Number(res.headers.get("Retry-After") || "0");
       const waitMs = (retryAfter ? retryAfter * 1000 : 2500) + Math.floor(Math.random() * 1200);
-      console.log(`429 rate limited. Waiting ${Math.round(waitMs/1000)}s…`);
+      console.log(`429 rate limited. Waiting ${Math.round(waitMs / 1000)}s…`);
       await sleep(waitMs);
       continue;
     }
@@ -77,12 +134,13 @@ async function gql(query, variables) {
       const msg = json.errors.map(e => e.message).join("\n");
       if (/too many requests|rate limit/i.test(msg)) {
         const waitMs = 2500 + Math.floor(Math.random() * 1200);
-        console.log(`Rate limit error. Waiting ${Math.round(waitMs/1000)}s…`);
+        console.log(`Rate limit error. Waiting ${Math.round(waitMs / 1000)}s…`);
         await sleep(waitMs);
         continue;
       }
       throw new Error(msg);
     }
+
     return json.data;
   }
   throw new Error("Too many rate-limit retries. Reduce limits or rerun later.");
@@ -135,6 +193,7 @@ async function fetchCharactersForMedia(mediaId, perTitle) {
   `;
   const data = await gql(query, { id: mediaId, perPage: perTitle });
   const edges = data?.Media?.characters?.edges || [];
+
   return edges
     .map(ed => ({
       id: ed?.node?.id,
@@ -146,31 +205,21 @@ async function fetchCharactersForMedia(mediaId, perTitle) {
     .filter(c => c.id && (c.nameNative || c.nameFull));
 }
 
-// Try TermEntry methods across versions
-function buildTermEntry(term, html) {
+// Build term entry using whichever methods exist in your installed version
+function buildTermEntry(term, definitionObj) {
   const te = new TermEntry(term);
 
-  // Some versions require reading to be explicitly set (can be empty)
-  if (typeof te.setReading === "function") {
-    te.setReading(""); // required by builder; empty is OK for names
-  } else if (typeof te.setKana === "function") {
-    te.setKana(""); // fallback name in some versions
-  }
+  // Your installed version requires reading to be explicitly set.
+  if (typeof te.setReading === "function") te.setReading("");
+  else if (typeof te.setKana === "function") te.setKana("");
 
-  // Prefer the most detailed method if present; fall back gracefully
-  if (typeof te.addDetailedDefinition === "function") {
-    return te.addDetailedDefinition(html).build();
-  }
-  if (typeof te.addDefinition === "function") {
-    return te.addDefinition(html).build();
-  }
-  if (typeof te.addGlossary === "function") {
-    return te.addGlossary(html).build();
-  }
+  // Pass a definition OBJECT (structured-content), not HTML strings.
+  if (typeof te.addDetailedDefinition === "function") return te.addDetailedDefinition(definitionObj).build();
+  if (typeof te.addDefinition === "function") return te.addDefinition(definitionObj).build();
+  if (typeof te.addGlossary === "function") return te.addGlossary(definitionObj).build();
 
   throw new Error("Unsupported yomichan-dict-builder version: no known TermEntry definition method.");
 }
-
 
 async function main() {
   const userName = process.env.ANILIST_USER;
@@ -197,7 +246,7 @@ async function main() {
 
   for (let i = 0; i < titles.length; i++) {
     const t = titles[i];
-    console.log(`(${i+1}/${titles.length}) ${t.title}`);
+    console.log(`(${i + 1}/${titles.length}) ${t.title}`);
     const chars = await fetchCharactersForMedia(t.id, CHARS_PER_TITLE);
 
     for (const c of chars) {
@@ -230,7 +279,7 @@ async function main() {
     .setTitle(`AniList Characters (CURRENT) — ${userName}`)
     .setRevision("1")
     .setAuthor("AniList → Yomitan Generator (GitHub Actions)")
-    .setDescription("Character dictionary from AniList CURRENT only. Images embedded as data URLs. Spoilers removed. Supports full + partial name lookup.")
+    .setDescription("Character dictionary from AniList CURRENT only. Structured content definitions. Spoilers removed. Supports full + partial name lookup.")
     .setAttribution("Data via AniList GraphQL API (anilist.co). Images/descriptions from AniList content sources. Generated for personal use.")
     .build();
 
@@ -246,6 +295,7 @@ async function main() {
     const it = entries[i];
     const from = [...it.fromSet].slice(0, 6).join(", ");
 
+    // Embedded image (data URL)
     let imgDataUrl = "";
     try {
       imgDataUrl = await limit(() => imageUrlToDataUrl(it.imageUrl));
@@ -253,20 +303,20 @@ async function main() {
       imgDataUrl = "";
     }
 
-    const displayName = it.nameNative || it.nameFull || "";
-    const html =
-      `<div>` +
-      (imgDataUrl ? `<div><img src="${imgDataUrl}" style="max-width:220px;height:auto;border-radius:10px;"></div>` : ``) +
-      `<div style="margin-top:6px;"><b>${displayName}</b></div>` +
-      (it.nameNative && it.nameFull && it.nameNative !== it.nameFull ? `<div>(${it.nameFull})</div>` : ``) +
-      (from ? `<div><i>From:</i> ${from}</div>` : ``) +
-      (it.descriptionHtml ? `<div style="margin-top:6px;">${it.descriptionHtml}</div>` : ``) +
-      `</div>`;
+    const descriptionText = it.descriptionHtml ? htmlToText(it.descriptionHtml) : "";
+
+    const definitionObj = makeStructuredDefinition({
+      nameNative: it.nameNative,
+      nameFull: it.nameFull,
+      from,
+      descriptionText,
+      imgDataUrl
+    });
 
     const terms = makeAliases(it.nameNative, it.nameFull);
 
     for (const term of terms) {
-      const teBuilt = buildTermEntry(term, html);
+      const teBuilt = buildTermEntry(term, definitionObj);
       await dictionary.addTerm(teBuilt);
     }
   }
